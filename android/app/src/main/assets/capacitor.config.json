@@ -1,0 +1,9 @@
+{
+	"appId": "com.agentpro.ghana",
+	"appName": "AgentPro Ghana",
+	"webDir": "www",
+	"android": {},
+	"server": {
+		"cleartext": false
+	}
+}
