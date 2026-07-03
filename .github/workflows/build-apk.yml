@@ -33,7 +33,7 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: - name: Add Capacitor Android platform
+      - name: Add Capacitor Android platform
         run: rm -rf android && npx cap add android
 
       - name: Sync web assets into Android
