@@ -54,7 +54,7 @@ import {
    responses, not assumed ones. See BACKEND_IMPLEMENTATION_NOTES.md.
 --------------------------------------------------------- */
 
-const API_BASE_URL = "https://agentpro-api-imuu.onrender.com";
+const API_BASE_URL = "https://agentpro-api-zsu1.onrender.com";
 
 class ApiError extends Error {
   constructor(status, body) {
@@ -110,6 +110,8 @@ function createApiClient(getToken, onUnauthorized) {
 
   return {
     pinLogin: (phone, pin, deviceId) => request("POST", "/auth/pin-login", { phone, pin, deviceId }),
+    register: (businessName, fullName, phone, pin, deviceId) =>
+      request("POST", "/auth/register", { businessName, fullName, phone, pin, deviceId }),
     getDashboardSummary: () => request("GET", "/dashboard/summary"),
     listTransactions: (params = {}) => {
       const query = new URLSearchParams();
@@ -952,9 +954,12 @@ function ActionButton({ icon: Icon, label, tone, onClick }) {
   );
 }
 
-/* ---------------- Login Screen ---------------- */
+/* ---------------- Login / Register Screen ---------------- */
 
 function LoginScreen({ api, onLogin }) {
+  const [mode, setMode] = useState("signin"); // "signin" | "register"
+  const [businessName, setBusinessName] = useState("");
+  const [fullName, setFullName] = useState("");
   const [phone, setPhone] = useState("");
   const [pin, setPin] = useState("");
   const [error, setError] = useState("");
@@ -965,10 +970,17 @@ function LoginScreen({ api, onLogin }) {
   // artifact (no persistent storage available), which is fine for
   // demoing the login flow itself but means the backend's "first
   // login on this device" record resets every reload — a real
-  // mobile app would generate this once and persist it on-device.
+  // mobile app (e.g. the Capacitor/Android build) would generate this
+  // once and persist it on-device instead.
   const deviceIdRef = useRef(generateClientId());
 
-  async function handleSubmit() {
+  function switchMode(next) {
+    setMode(next);
+    setError("");
+    setPin("");
+  }
+
+  async function handleSignIn() {
     if (phone.trim().length === 0) {
       setError("Enter your phone number.");
       return;
@@ -984,12 +996,47 @@ function LoginScreen({ api, onLogin }) {
       onLogin(result.user, result.accessToken);
     } catch (err) {
       if (err.isNetworkError) {
-        setError(`Can't reach the server at ${API_BASE_URL}. Is the backend running and reachable from this browser?`);
+        setError(`Can't reach the server at ${API_BASE_URL}. Is the backend running and reachable from this app?`);
       } else if (err.status === 401) {
         setError("Incorrect phone number or PIN.");
         setPin("");
       } else {
-        setError(err.message || "Login failed.");
+        setError(err.message || "Sign in failed.");
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleRegister() {
+    if (businessName.trim().length === 0) {
+      setError("Enter your business name.");
+      return;
+    }
+    if (fullName.trim().length === 0) {
+      setError("Enter your full name.");
+      return;
+    }
+    if (!/^0\d{9}$/.test(phone.trim())) {
+      setError("Enter a valid 10-digit phone number starting with 0 (e.g. 0244123456).");
+      return;
+    }
+    if (pin.length !== 4) {
+      setError("Choose a 4-digit PIN.");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const result = await api.register(businessName.trim(), fullName.trim(), phone.trim(), pin, deviceIdRef.current);
+      onLogin(result.user, result.accessToken);
+    } catch (err) {
+      if (err.isNetworkError) {
+        setError(`Can't reach the server at ${API_BASE_URL}. Is the backend running and reachable from this app?`);
+      } else if (err.status === 409) {
+        setError("An account with this phone number already exists. Try signing in instead.");
+      } else {
+        setError(err.message || "Registration failed.");
       }
     } finally {
       setLoading(false);
@@ -1002,25 +1049,75 @@ function LoginScreen({ api, onLogin }) {
     setPin(pin + d);
   }
 
+  const inputStyle = {
+    width: "100%",
+    borderRadius: 12,
+    border: "1px solid rgba(255,255,255,0.25)",
+    background: "rgba(255,255,255,0.1)",
+    padding: "12px 14px",
+    fontSize: 14,
+    color: COLORS.white,
+    marginBottom: 12,
+    boxSizing: "border-box",
+    outline: "none",
+  };
+
   return (
-    <div style={{ width: "100%", minHeight: 600, background: COLORS.green, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "0 24px", color: COLORS.white, fontFamily: "sans-serif" }}>
+    <div style={{ width: "100%", minHeight: 600, background: COLORS.green, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "24px 24px", color: COLORS.white, fontFamily: "sans-serif" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
         <span style={{ height: 10, width: 10, borderRadius: 999, background: COLORS.gold, display: "inline-block" }} />
         <p style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 3, fontWeight: 600, color: COLORS.gold, margin: 0 }}>AgentPro Ghana</p>
       </div>
-      <h1 style={{ fontSize: 22, fontWeight: 700, marginBottom: 4 }}>Sign in</h1>
-      <p style={{ fontSize: 12.5, color: COLORS.white65, marginBottom: 24, textAlign: "center" }}>
-        Demo accounts — Owner 0244111111 / 1111 · Manager 0244222222 / 2222 · Agent 0244333333 / 3333 · Cashier 0244444444 / 4444
-      </p>
+      <h1 style={{ fontSize: 22, fontWeight: 700, marginBottom: 16 }}>{mode === "signin" ? "Sign in" : "Create your account"}</h1>
+
+      <div style={{ display: "flex", width: "100%", maxWidth: 280, borderRadius: 12, background: "rgba(255,255,255,0.1)", padding: 4, marginBottom: 20 }}>
+        <button
+          type="button"
+          onClick={() => switchMode("signin")}
+          style={{ flex: 1, padding: "8px 0", borderRadius: 9, border: "none", fontSize: 12.5, fontWeight: 700, background: mode === "signin" ? COLORS.white : "transparent", color: mode === "signin" ? COLORS.green : COLORS.white }}
+        >
+          Sign In
+        </button>
+        <button
+          type="button"
+          onClick={() => switchMode("register")}
+          style={{ flex: 1, padding: "8px 0", borderRadius: 9, border: "none", fontSize: 12.5, fontWeight: 700, background: mode === "register" ? COLORS.white : "transparent", color: mode === "register" ? COLORS.green : COLORS.white }}
+        >
+          New Business
+        </button>
+      </div>
 
       <div style={{ width: "100%", maxWidth: 280 }}>
+        {mode === "register" && (
+          <>
+            <input
+              type="text"
+              value={businessName}
+              onChange={(e) => setBusinessName(e.target.value)}
+              placeholder="Business name"
+              style={inputStyle}
+            />
+            <input
+              type="text"
+              value={fullName}
+              onChange={(e) => setFullName(e.target.value)}
+              placeholder="Your full name"
+              style={inputStyle}
+            />
+          </>
+        )}
+
         <input
           type="tel"
           value={phone}
           onChange={(e) => setPhone(e.target.value)}
-          placeholder="Phone number"
-          style={{ width: "100%", borderRadius: 12, border: "1px solid rgba(255,255,255,0.25)", background: "rgba(255,255,255,0.1)", padding: "12px 14px", fontSize: 14, color: COLORS.white, marginBottom: 12, boxSizing: "border-box", outline: "none" }}
+          placeholder="Phone number (e.g. 0244123456)"
+          style={inputStyle}
         />
+
+        <p style={{ fontSize: 11, color: COLORS.white65, marginBottom: 8, textAlign: "center" }}>
+          {mode === "signin" ? "Enter your PIN" : "Choose a 4-digit PIN"}
+        </p>
 
         <div style={{ display: "flex", gap: 12, marginBottom: 12, justifyContent: "center" }}>
           {[0, 1, 2, 3].map((i) => (
@@ -1049,7 +1146,7 @@ function LoginScreen({ api, onLogin }) {
                   type="button"
                   key={i}
                   onClick={() => setPin((p) => p.slice(0, -1))}
-                  style={{ height: 60, borderRadius: 16, background: "rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 600, color: COLORS.white, border: "none" }}
+                  style={{ height: 56, borderRadius: 16, background: "rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 600, color: COLORS.white, border: "none" }}
                 >
                   Delete
                 </button>
@@ -1060,7 +1157,7 @@ function LoginScreen({ api, onLogin }) {
                 type="button"
                 key={i}
                 onClick={() => handleDigit(key)}
-                style={{ height: 60, borderRadius: 16, background: "rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 19, fontWeight: 700, color: COLORS.white, border: "none" }}
+                style={{ height: 56, borderRadius: 16, background: "rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 19, fontWeight: 700, color: COLORS.white, border: "none" }}
               >
                 {key}
               </button>
@@ -1070,18 +1167,18 @@ function LoginScreen({ api, onLogin }) {
 
         <button
           type="button"
-          onClick={handleSubmit}
+          onClick={mode === "signin" ? handleSignIn : handleRegister}
           disabled={loading}
           style={{ width: "100%", marginTop: 16, borderRadius: 12, background: COLORS.gold, color: COLORS.ink, fontWeight: 700, padding: "14px 0", fontSize: 14.5, border: "none", opacity: loading ? 0.5 : 1 }}
         >
-          {loading ? "Signing in..." : "Sign in"}
+          {loading ? (mode === "signin" ? "Signing in..." : "Creating account...") : mode === "signin" ? "Sign in" : "Create account"}
         </button>
       </div>
 
-      <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 28, color: "rgba(255,255,255,0.45)" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 24, color: "rgba(255,255,255,0.45)" }}>
         <Lock size={12} />
         <p style={{ fontSize: 11, margin: 0, textAlign: "center" }}>
-          Connecting to {API_BASE_URL} — change API_BASE_URL near the top of this file if your backend runs elsewhere
+          Connecting to {API_BASE_URL}
         </p>
       </div>
     </div>
