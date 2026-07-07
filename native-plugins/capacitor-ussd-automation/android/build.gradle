@@ -15,7 +15,7 @@ android {
         // lower than this, which is exactly why the CI workflow has an
         // explicit step bumping it to 26 after `cap add` runs.
         minSdkVersion 26
-        targetSdkVersion rootProject.ext.targetSdkVersion
+        targetSdk 35
     }
 
     compileOptions {
