@@ -1,0 +1,31 @@
+name: Bootstrap Super Admin
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Bootstrap Super Admin
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_SSL: "true"
+          SUPER_ADMIN_EMAIL: ${{ secrets.SUPER_ADMIN_EMAIL }}
+          SUPER_ADMIN_PASSWORD: ${{ secrets.SUPER_ADMIN_PASSWORD }}
+          SUPER_ADMIN_FULL_NAME: ${{ secrets.SUPER_ADMIN_FULL_NAME }}
+          SUPER_ADMIN_PHONE: ${{ secrets.SUPER_ADMIN_PHONE }}
+        run: npm run bootstrap:super-admin
