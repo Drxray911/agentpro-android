@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  packageNames is deliberately left unset (monitor every package), not
+  restricted to e.g. "com.android.phone" — the USSD response dialog is
+  shown by different system packages depending on OEM (stock AOSP,
+  Samsung, Xiaomi/MIUI, etc. each ship their own phone/dialer app under
+  a different package name). Restricting to one known package would
+  make this silently stop working on any device whose OEM uses a
+  different one. Instead, UssdAccessibilityService itself filters
+  events by inspecting node structure (looking for the characteristic
+  shape of a USSD dialog: a message TextView + an EditText + a
+  send/cancel button) rather than by package name allowlist — see the
+  comment block at the top of that class for the honest caveat this
+  implies: this heuristic needs validation against real devices per
+  OEM before production use, since it cannot be exercised in an
+  automated test environment without physical SIM/telephony hardware.
+
+  flagRequestFilterKeyEvents and flagReportViewIds are both enabled to
+  give the service the most complete view of the dialog's node tree
+  available (view IDs help distinguish the input field from the
+  message body more reliably than text alone).
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows"
+    android:canRetrieveWindowContent="true"
+    android:notificationTimeout="100"
+    android:description="@string/ussd_accessibility_service_description" />

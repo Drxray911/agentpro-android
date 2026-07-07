@@ -1,0 +1,34 @@
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+android {
+    namespace "com.agentpro.ussd"
+    compileSdk rootProject.ext.compileSdkVersion
+
+    defaultConfig {
+        // TelephonyManager.sendUssdRequest() and
+        // createForSubscriptionId() both require API 26 (Android 8.0).
+        // This plugin cannot function below that, so it declares its
+        // own floor here rather than silently degrading — Gradle will
+        // fail the build loudly if the app-level minSdkVersion (set in
+        // android/variables.gradle, regenerated on every `cap add`) is
+        // lower than this, which is exactly why the CI workflow has an
+        // explicit step bumping it to 26 after `cap add` runs.
+        minSdkVersion 26
+        targetSdkVersion rootProject.ext.targetSdkVersion
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    implementation project(':capacitor-android')
+    implementation "androidx.core:core-ktx:1.13.1"
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.24"
+}

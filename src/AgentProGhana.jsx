@@ -1,4 +1,6 @@
 import React, { useState, useMemo, useEffect, useRef } from "react";
+import { Capacitor } from "@capacitor/core";
+import { UssdAutomation } from "capacitor-ussd-automation";
 import {
   ArrowDownToLine,
   ArrowUpFromLine,
@@ -33,6 +35,9 @@ import {
   WifiOff,
   RefreshCw,
   CheckCircle2,
+  Clock,
+  CreditCard,
+  Store,
 } from "lucide-react";
 
 /* ---------------------------------------------------------
@@ -109,9 +114,29 @@ function createApiClient(getToken, onUnauthorized) {
   }
 
   return {
+    // Business Owner auth: email + password. Registration no longer
+    // returns a token — the account sits in pending_approval until a
+    // Superuser confirms payment, so callers must handle the
+    // { status: "pending_approval" } shape rather than assuming a
+    // token comes back.
+    login: (email, password, deviceId) => request("POST", "/auth/login", { email, password, deviceId }),
+    register: (businessName, fullName, email, password, phone, businessRegNumber, deviceId) =>
+      request("POST", "/auth/register", {
+        businessName,
+        fullName,
+        email,
+        password,
+        phone,
+        businessRegNumber: businessRegNumber || undefined,
+        deviceId,
+      }),
+    requestPasswordReset: (email) => request("POST", "/auth/password-reset/request", { email }),
+    resetPassword: (token, newPassword) =>
+      request("POST", "/auth/password-reset/confirm", { token, newPassword }),
+    // Agent/Manager auth: phone + 4-digit app PIN, set up by the
+    // Business Owner inside the app — unaffected by the registration
+    // rework above.
     pinLogin: (phone, pin, deviceId) => request("POST", "/auth/pin-login", { phone, pin, deviceId }),
-    register: (businessName, fullName, phone, pin, deviceId) =>
-      request("POST", "/auth/register", { businessName, fullName, phone, pin, deviceId }),
     getDashboardSummary: () => request("GET", "/dashboard/summary"),
     listTransactions: (params = {}) => {
       const query = new URLSearchParams();
@@ -129,9 +154,60 @@ function createApiClient(getToken, onUnauthorized) {
     listCustomers: (query) => request("GET", `/customers${query ? "?query=" + encodeURIComponent(query) : ""}`),
     setCustomerFavorite: (id, isFavorite) => request("PUT", `/customers/${id}/favorite`, { isFavorite }),
     getCommissionRates: () => request("GET", "/commission-rates"),
-    updateCommissionRates: (rates) => request("PUT", "/commission-rates", rates),
+    getUssdTemplates: () => request("GET", "/ussd-templates"),
+    // PUT /commission-rates is Superuser-only as of the commission
+    // engine rework (see commissions.controller.ts) and now expects
+    // { organizationId, branchId?, items } rather than a bare array —
+    // kept here for a future Superuser admin surface, but the mobile
+    // app's CommissionsScreen no longer calls this directly; Business
+    // Owners go through the request/approval flow below instead.
+    updateCommissionRates: (payload) => request("PUT", "/commission-rates", payload),
+    requestCommissionRate: (payload) => request("POST", "/commission-rates/requests", payload),
+    listMyCommissionRateRequests: () => request("GET", "/commission-rates/requests/mine"),
+    listPendingCommissionRateRequests: () => request("GET", "/commission-rates/requests/pending"),
+    approveCommissionRateRequest: (id) => request("POST", `/commission-rates/requests/${id}/approve`),
+    rejectCommissionRateRequest: (id, reason) =>
+      request("POST", `/commission-rates/requests/${id}/reject`, { reason }),
+    getSubscriptionStatus: () => request("GET", "/subscriptions/status"),
+    getSubscriptionPlatformSettings: () => request("GET", "/subscriptions/platform-settings"),
+    submitRenewalPayment: (paymentReference) =>
+      request("POST", "/subscriptions/renewal-payments", { paymentReference }),
+    listMyRenewalPayments: () => request("GET", "/subscriptions/renewal-payments/mine"),
+    listPendingRenewalPayments: () => request("GET", "/subscriptions/renewal-payments/pending"),
+    verifyRenewalPayment: (id) => request("POST", `/subscriptions/renewal-payments/${id}/verify`),
+    rejectRenewalPayment: (id, reason) =>
+      request("POST", `/subscriptions/renewal-payments/${id}/reject`, { reason }),
+    // Business Hub (the app's marketplace)
+    createBusinessHubListing: (payload) => request("POST", "/business-hub/listings", payload),
+    browseBusinessHubListings: (category, location) => {
+      const params = new URLSearchParams();
+      if (category) params.set("category", category);
+      if (location) params.set("location", location);
+      const qs = params.toString();
+      return request("GET", `/business-hub/listings${qs ? "?" + qs : ""}`);
+    },
+    listMyBusinessHubListings: () => request("GET", "/business-hub/listings/mine"),
+    listPendingBusinessHubListings: () => request("GET", "/business-hub/listings/pending-review"),
+    approveBusinessHubListingContent: (id) => request("POST", `/business-hub/listings/${id}/approve-content`),
+    rejectBusinessHubListingContent: (id, reason) =>
+      request("POST", `/business-hub/listings/${id}/reject-content`, { reason }),
+    submitBusinessHubListingPayment: (id, paymentReference) =>
+      request("POST", `/business-hub/listings/${id}/payments`, { paymentReference }),
+    listPendingBusinessHubPayments: () => request("GET", "/business-hub/listing-payments/pending"),
+    verifyBusinessHubListingPayment: (id) => request("POST", `/business-hub/listing-payments/${id}/verify`),
+    rejectBusinessHubListingPayment: (id, reason) =>
+      request("POST", `/business-hub/listing-payments/${id}/reject`, { reason }),
     listSupportTickets: (status) => request("GET", `/support/tickets${status ? "?status=" + status : ""}`),
     createSupportTicket: (payload) => request("POST", "/support/tickets", payload),
+    // Superuser-only: reviewing and activating Business Owner
+    // registrations. See admin.controller.ts — every one of these is
+    // gated by @Roles('super_admin') on the backend, so a non-Superuser
+    // hitting these would get a 403 regardless of what the UI shows.
+    listPendingOrganizations: () => request("GET", "/admin/organizations/pending"),
+    approveOrganization: (organizationId, paymentReference) =>
+      request("POST", `/admin/organizations/${organizationId}/approve`, { paymentReference }),
+    rejectOrganization: (organizationId, reason) =>
+      request("POST", `/admin/organizations/${organizationId}/reject`, { reason }),
     addTicketMessage: (ticketId, message) => request("POST", `/support/tickets/${ticketId}/messages`, { message }),
     syncBatch: (transactions, floatMovements) => request("POST", "/sync/batch", { transactions, floatMovements }),
   };
@@ -193,10 +269,10 @@ const NETWORKS = {
 // Business Owner: ROLES[currentUser.role] was undefined because the
 // real API returns "business_owner", not "owner".
 const ROLES = {
-  super_admin: { label: "Super Admin", permissions: ["dashboard", "history", "customers", "commissions", "float", "support", "assistant"] },
-  business_owner: { label: "Business Owner", permissions: ["dashboard", "history", "customers", "commissions", "float", "support", "assistant"] },
-  branch_manager: { label: "Branch Manager", permissions: ["dashboard", "history", "customers", "float", "support", "assistant"] },
-  agent: { label: "Agent", permissions: ["dashboard", "history", "customers", "support", "assistant"] },
+  super_admin: { label: "Super Admin", permissions: ["dashboard", "history", "customers", "commissions", "float", "support", "assistant", "approvals"] },
+  business_owner: { label: "Business Owner", permissions: ["dashboard", "history", "customers", "commissions", "float", "support", "assistant", "subscription", "businessHub"] },
+  branch_manager: { label: "Branch Manager", permissions: ["dashboard", "history", "customers", "float", "support", "assistant", "businessHub"] },
+  agent: { label: "Agent", permissions: ["dashboard", "history", "customers", "support", "assistant", "businessHub"] },
   cashier: { label: "Cashier", permissions: ["dashboard", "support"] },
   auditor: { label: "Auditor", permissions: ["dashboard", "history", "support"] },
 };
@@ -289,6 +365,7 @@ function FullScreenError({ message, onRetry }) {
 
 export default function AgentProGhana() {
   const [currentUser, setCurrentUser] = useState(null);
+  const [subscriptionWarning, setSubscriptionWarning] = useState(null);
   const [accessToken, setAccessTokenState] = useState(null);
   const tokenRef = useRef(null);
 
@@ -306,11 +383,22 @@ export default function AgentProGhana() {
   const [dashboardError, setDashboardError] = useState(null);
   const [dashboardLoading, setDashboardLoading] = useState(false);
   const [rates, setRates] = useState(null);
+  const [ussdTemplates, setUssdTemplates] = useState([]);
+  const [ussdAutomationEnabled, setUssdAutomationEnabled] = useState(false);
+  const [ussdAccessibilityGranted, setUssdAccessibilityGranted] = useState(false);
+  const [simSlots, setSimSlots] = useState([]);
+  const [ussdSession, setUssdSession] = useState(null); // { status, log[], network, type } while a live USSD automation run is in progress
   const [floatHistory, setFloatHistory] = useState([]);
   const [customers, setCustomers] = useState([]);
   const [historyTransactions, setHistoryTransactions] = useState([]);
   const [historyTotals, setHistoryTotals] = useState({ count: 0, volume: "0.00", commission: "0.00" });
   const [supportTickets, setSupportTickets] = useState([]);
+  const [pendingOrganizations, setPendingOrganizations] = useState([]);
+  const [pendingCommissionRequests, setPendingCommissionRequests] = useState([]);
+  const [subscriptionStatus, setSubscriptionStatus] = useState(null);
+  const [pendingRenewals, setPendingRenewals] = useState([]);
+  const [pendingHubListings, setPendingHubListings] = useState([]);
+  const [pendingHubPayments, setPendingHubPayments] = useState([]);
 
   // Transactions created while offline, queued in memory (not
   // localStorage — artifacts can't use browser storage; see the
@@ -393,6 +481,33 @@ export default function AgentProGhana() {
     }
   }
 
+  async function loadUssdTemplates() {
+    try {
+      const data = await api.getUssdTemplates();
+      setUssdTemplates(data);
+    } catch (err) {
+      if (err.isNetworkError) setIsOnline(false);
+    }
+  }
+
+  // Only meaningful on an actual Android build with the native plugin
+  // present — in a browser preview, Capacitor.isNativePlatform() is
+  // false and this is skipped entirely, leaving ussdAutomationEnabled
+  // false and the transaction flow on its existing manual-record path.
+  async function refreshUssdCapabilities() {
+    if (!Capacitor.isNativePlatform()) return;
+    try {
+      const { enabled } = await UssdAutomation.isAccessibilityServiceEnabled();
+      setUssdAccessibilityGranted(enabled);
+      const { slots } = await UssdAutomation.getSimSlots();
+      setSimSlots(slots || []);
+    } catch (err) {
+      // Plugin present but a call failed (e.g. permission not yet
+      // granted) — leave automation off rather than surface an error
+      // for a feature the person hasn't tried to use yet.
+    }
+  }
+
   async function loadFloatHistory() {
     try {
       const data = await api.listFloatMovements();
@@ -430,6 +545,60 @@ export default function AgentProGhana() {
     }
   }
 
+  async function loadPendingOrganizations() {
+    try {
+      const data = await api.listPendingOrganizations();
+      setPendingOrganizations(data);
+    } catch (err) {
+      if (err.isNetworkError) setIsOnline(false);
+    }
+  }
+
+  async function loadPendingCommissionRequests() {
+    try {
+      const data = await api.listPendingCommissionRateRequests();
+      setPendingCommissionRequests(data);
+    } catch (err) {
+      if (err.isNetworkError) setIsOnline(false);
+    }
+  }
+
+  async function loadSubscriptionStatus() {
+    try {
+      const data = await api.getSubscriptionStatus();
+      setSubscriptionStatus(data);
+    } catch (err) {
+      if (err.isNetworkError) setIsOnline(false);
+    }
+  }
+
+  async function loadPendingRenewals() {
+    try {
+      const data = await api.listPendingRenewalPayments();
+      setPendingRenewals(data);
+    } catch (err) {
+      if (err.isNetworkError) setIsOnline(false);
+    }
+  }
+
+  async function loadPendingHubListings() {
+    try {
+      const data = await api.listPendingBusinessHubListings();
+      setPendingHubListings(data);
+    } catch (err) {
+      if (err.isNetworkError) setIsOnline(false);
+    }
+  }
+
+  async function loadPendingHubPayments() {
+    try {
+      const data = await api.listPendingBusinessHubPayments();
+      setPendingHubPayments(data);
+    } catch (err) {
+      if (err.isNetworkError) setIsOnline(false);
+    }
+  }
+
   useEffect(() => {
     if (currentUser) {
       loadDashboard();
@@ -439,6 +608,24 @@ export default function AgentProGhana() {
       // from the dashboard — GET /commission-rates has no role
       // restriction (only PUT does), so this is safe for every role.
       loadRates();
+      // Same reasoning as rates above: needed as soon as the
+      // transaction modal can open, not only if/when a dedicated USSD
+      // settings screen is visited.
+      loadUssdTemplates();
+      refreshUssdCapabilities();
+      // Super Admin needs the pending-approvals count on the dashboard
+      // badge immediately on login, not only after visiting the
+      // Approvals screen once.
+      if (currentUser.role === "super_admin") {
+        loadPendingOrganizations();
+        loadPendingCommissionRequests();
+        loadPendingRenewals();
+        loadPendingHubListings();
+        loadPendingHubPayments();
+      }
+      if (currentUser.role === "business_owner") {
+        loadSubscriptionStatus();
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentUser]);
@@ -455,13 +642,26 @@ export default function AgentProGhana() {
     if (screen === "commissions") loadRates();
     if (screen === "float") loadFloatHistory();
     if (screen === "support") loadSupportTickets();
+    if (screen === "approvals") {
+      loadPendingOrganizations();
+      loadPendingCommissionRequests();
+      loadPendingRenewals();
+      loadPendingHubListings();
+      loadPendingHubPayments();
+    }
+    if (screen === "subscription") loadSubscriptionStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [screen, currentUser]);
 
-  function handleLogin(user, token) {
+  function handleLogin(user, token, subWarning) {
     setCurrentUser(user);
     setAccessTokenState(token);
     tokenRef.current = token;
+    setSubscriptionWarning(subWarning || null);
+  }
+
+  function dismissSubscriptionWarning() {
+    setSubscriptionWarning(null);
   }
 
   function handleLogout() {
@@ -472,16 +672,133 @@ export default function AgentProGhana() {
     setScreen("dashboard");
   }
 
+  // True only when every precondition for actually dialing is met:
+  // a real Android device (not the browser preview), the person has
+  // opted in, they've enabled the accessibility service in Settings,
+  // there's an active template for this network/type, and a SIM slot
+  // is available for that network. Any single missing piece means
+  // "fall back to manual recording" rather than a half-working attempt.
+  function ussdAutomationAvailable(network, apiType) {
+    if (!Capacitor.isNativePlatform() || !ussdAutomationEnabled || !ussdAccessibilityGranted) return false;
+    const template = ussdTemplates.find((t) => t.network === network && t.transactionType === apiType);
+    const simSlot = simSlots.find((s) => s.matchedNetwork === network);
+    return Boolean(template && simSlot);
+  }
+
+  /**
+   * Drives one USSD automation attempt end to end: dials the correct
+   * SIM, feeds the person's live progress in ussdSession state as
+   * screen updates arrive, and resolves/rejects once the network
+   * reports success or failure (or the person cancels). Never touches
+   * a MoMo PIN — see UssdAccessibilityService.kt's file-level comment
+   * for exactly how that's enforced on the native side; this function
+   * only ever sees whatever text the network shows on screen, same as
+   * the person would see themselves.
+   */
+  function startUssdAutomation({ network, apiType, amount, customerPhone }) {
+    const template = ussdTemplates.find((t) => t.network === network && t.transactionType === apiType);
+    const simSlot = simSlots.find((s) => s.matchedNetwork === network);
+    if (!template || !simSlot) {
+      return Promise.reject(new Error("USSD automation isn't set up for this network/transaction yet."));
+    }
+
+    setUssdSession({ status: "dialing", log: ["Dialing network..."], network, apiType });
+
+    const listeners = [];
+    const cleanup = () => listeners.forEach((l) => l.remove());
+
+    return new Promise((resolve, reject) => {
+      listeners.push(
+        UssdAutomation.addListener("ussdScreenUpdate", ({ rawText }) => {
+          setUssdSession((prev) => (prev ? { ...prev, status: "navigating", log: [...prev.log, rawText] } : prev));
+        }),
+      );
+      listeners.push(
+        UssdAutomation.addListener("ussdAwaitingPin", () => {
+          setUssdSession((prev) =>
+            prev ? { ...prev, status: "awaiting_pin", log: [...prev.log, "Awaiting PIN entry (your action required on the network screen)"] } : prev,
+          );
+        }),
+      );
+      listeners.push(
+        UssdAutomation.addListener("ussdSessionSuccess", ({ rawText }) => {
+          setUssdSession((prev) => (prev ? { ...prev, status: "success", log: [...prev.log, rawText, "Transaction Successful"] } : prev));
+          cleanup();
+          resolve(rawText);
+        }),
+      );
+      listeners.push(
+        UssdAutomation.addListener("ussdSessionFailed", ({ reason, rawText }) => {
+          const message =
+            reason === "timeout"
+              ? "The network didn't respond in time."
+              : rawText || "The transaction could not be completed.";
+          setUssdSession((prev) => (prev ? { ...prev, status: "failed", log: [...prev.log, message] } : prev));
+          cleanup();
+          reject(new Error(message));
+        }),
+      );
+      listeners.push(
+        UssdAutomation.addListener("ussdSessionCancelled", () => {
+          cleanup();
+          reject(new Error("cancelled"));
+        }),
+      );
+
+      UssdAutomation.startSession({
+        subscriptionId: simSlot.subscriptionId,
+        ussdCode: template.ussdCode,
+        steps: template.steps,
+        successPatterns: template.successPatterns,
+        failurePatterns: template.failurePatterns,
+        pinPromptPatterns: template.pinPromptPatterns,
+        stepTimeoutMs: template.stepTimeoutMs,
+        maxRetries: template.maxRetries,
+        values: { amount: amount.toFixed(2), customerPhone: customerPhone || "" },
+      }).catch((err) => {
+        cleanup();
+        reject(err);
+      });
+    });
+  }
+
+  function cancelUssdAutomation() {
+    UssdAutomation.cancelSession().catch(() => {});
+    setUssdSession(null);
+  }
+
   async function recordTransaction({ type, network, customer, phone, amount }) {
     const typeMap = { "Cash-In": "cash_in", "Cash-Out": "cash_out", Airtime: "airtime", Data: "data_bundle" };
+    const apiType = typeMap[type];
     const payload = {
-      type: typeMap[type],
+      type: apiType,
       network,
       amount: amount.toFixed(2),
       customerPhone: phone || undefined,
       customerName: customer || undefined,
       clientGeneratedId: generateClientId(),
     };
+
+    // If USSD automation is fully set up for this network/transaction,
+    // actually dial and navigate it first — only once the network
+    // itself confirms success do we record the transaction in the
+    // ledger, since that's what genuinely happened. Everyone else
+    // (automation not enabled, no template yet, wrong device) keeps
+    // the app's original behavior of recording directly, on the
+    // understanding the agent performed the USSD transaction
+    // themselves outside the app.
+    if (ussdAutomationAvailable(network, apiType)) {
+      try {
+        await startUssdAutomation({ network, apiType, amount, customerPhone: phone });
+      } catch (err) {
+        setUssdSession(null);
+        if (err.message !== "cancelled") {
+          showToast(err.message || "USSD transaction failed");
+        }
+        return;
+      }
+      setUssdSession(null);
+    }
 
     if (!isOnline) {
       // Genuinely offline (detected via the browser's own online/
@@ -648,6 +965,9 @@ export default function AgentProGhana() {
                 {screen === "commissions" && "Commission Settings"}
                 {screen === "float" && "Float Management"}
                 {screen === "support" && "Support Centre"}
+                {screen === "approvals" && "Pending Approvals"}
+                {screen === "subscription" && "Subscription"}
+                {screen === "businessHub" && "Business Hub"}
               </h1>
               {screen === "dashboard" && (
                 <p style={{ fontSize: 11, color: COLORS.white65, margin: "2px 0 0" }}>{ROLES[currentUser.role].label}</p>
@@ -691,6 +1011,21 @@ export default function AgentProGhana() {
           </div>
         )}
 
+        {subscriptionWarning && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, background: COLORS.goldSoft, padding: "10px 16px" }}>
+            <AlertTriangle size={14} color={COLORS.gold} style={{ flexShrink: 0 }} />
+            <p style={{ fontSize: 11.5, fontWeight: 600, color: "#7A5A12", margin: 0, flex: 1 }}>{subscriptionWarning}</p>
+            {permissions.includes("subscription") && (
+              <button onClick={() => setScreen("subscription")} style={{ fontSize: 11, fontWeight: 700, color: COLORS.green, background: "none", border: "none", flexShrink: 0, textDecoration: "underline" }}>
+                Renew
+              </button>
+            )}
+            <button onClick={dismissSubscriptionWarning} aria-label="Dismiss" style={{ background: "none", border: "none", padding: 0, flexShrink: 0 }}>
+              <X size={14} color="#7A5A12" />
+            </button>
+          </div>
+        )}
+
         {screen === "dashboard" && (
           <DashboardScreen
             floatBal={floatBal}
@@ -700,6 +1035,8 @@ export default function AgentProGhana() {
             transactions={transactions}
             lowFloatNetworks={lowFloatNetworks}
             permissions={permissions}
+            pendingApprovalsCount={pendingOrganizations.length + pendingCommissionRequests.length + pendingRenewals.length + pendingHubListings.length + pendingHubPayments.length}
+            subscriptionStatus={subscriptionStatus}
             setActiveModal={setActiveModal}
             setScreen={setScreen}
             setReceipt={setReceipt}
@@ -716,7 +1053,7 @@ export default function AgentProGhana() {
         )}
 
         {screen === "commissions" && permissions.includes("commissions") && (
-          <CommissionsScreen rates={rates} api={api} showToast={showToast} onSaved={loadRates} />
+          <CommissionsScreen rates={rates} api={api} showToast={showToast} onSaved={loadRates} role={currentUser.role} setScreen={setScreen} />
         )}
 
         {screen === "float" && permissions.includes("float") && (
@@ -726,17 +1063,48 @@ export default function AgentProGhana() {
         {screen === "support" && (
           <SupportScreen tickets={supportTickets} api={api} onReload={loadSupportTickets} showToast={showToast} />
         )}
+
+        {screen === "approvals" && permissions.includes("approvals") && (
+          <ApprovalsScreen
+            organizations={pendingOrganizations}
+            onReload={loadPendingOrganizations}
+            commissionRequests={pendingCommissionRequests}
+            onReloadCommissionRequests={loadPendingCommissionRequests}
+            renewals={pendingRenewals}
+            onReloadRenewals={loadPendingRenewals}
+            hubListings={pendingHubListings}
+            onReloadHubListings={loadPendingHubListings}
+            hubPayments={pendingHubPayments}
+            onReloadHubPayments={loadPendingHubPayments}
+            api={api}
+            showToast={showToast}
+          />
+        )}
+
+        {screen === "subscription" && permissions.includes("subscription") && (
+          <SubscriptionScreen status={subscriptionStatus} api={api} onReload={loadSubscriptionStatus} showToast={showToast} />
+        )}
+
+        {screen === "businessHub" && permissions.includes("businessHub") && (
+          <BusinessHubScreen api={api} showToast={showToast} canCreate={currentUser.role === "business_owner"} />
+        )}
       </div>
 
       {/* Bottom nav */}
       <nav style={{ position: "fixed", bottom: 0, left: 0, right: 0, zIndex: 20, maxWidth: 448, margin: "0 auto", borderTop: `1px solid ${COLORS.ink12}`, background: "rgba(255,255,255,0.97)", padding: "8px 8px" }}>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)" }}>
+        <div style={{ display: "grid", gridTemplateColumns: `repeat(${4 + (permissions.includes("approvals") ? 1 : 0) + (permissions.includes("businessHub") ? 1 : 0)}, 1fr)` }}>
           <NavItem icon={TrendingUp} label="Dashboard" active={screen === "dashboard"} onClick={() => setScreen("dashboard")} />
           <NavItem icon={Receipt} label="Transactions" active={screen === "history"} onClick={() => setScreen("history")} />
           {permissions.includes("customers") ? (
             <NavItem icon={Users} label="Customers" active={screen === "customers"} onClick={() => setScreen("customers")} />
           ) : (
             <NavItem icon={Users} label="Customers" active={false} onClick={() => showToast("Your role doesn't have access to customers")} />
+          )}
+          {permissions.includes("businessHub") && (
+            <NavItem icon={Store} label="Business Hub" active={screen === "businessHub"} onClick={() => setScreen("businessHub")} />
+          )}
+          {permissions.includes("approvals") && (
+            <NavItem icon={Clock} label="Approvals" active={screen === "approvals"} onClick={() => setScreen("approvals")} badge={pendingOrganizations.length + pendingCommissionRequests.length + pendingRenewals.length + pendingHubListings.length + pendingHubPayments.length} />
           )}
           <NavItem icon={MessageCircle} label="Support" active={screen === "support"} onClick={() => setScreen("support")} />
         </div>
@@ -754,6 +1122,8 @@ export default function AgentProGhana() {
       {activeModal && (
         <TransactionModal type={activeModal} rates={rates} onClose={() => setActiveModal(null)} onSubmit={recordTransaction} />
       )}
+
+      {ussdSession && <UssdProgressModal session={ussdSession} onCancel={cancelUssdAutomation} />}
 
       {receipt && <ReceiptModal tx={receipt} onClose={() => setReceipt(null)} showToast={showToast} />}
 
@@ -792,10 +1162,17 @@ export default function AgentProGhana() {
   );
 }
 
-function NavItem({ icon: Icon, label, active, onClick }) {
+function NavItem({ icon: Icon, label, active, onClick, badge }) {
   return (
-    <button onClick={onClick} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4, padding: "6px 0", background: "none", border: "none" }}>
-      <Icon size={19} color={active ? COLORS.green : COLORS.ink40} />
+    <button onClick={onClick} style={{ position: "relative", display: "flex", flexDirection: "column", alignItems: "center", gap: 4, padding: "6px 0", background: "none", border: "none" }}>
+      <span style={{ position: "relative" }}>
+        <Icon size={19} color={active ? COLORS.green : COLORS.ink40} />
+        {badge > 0 && (
+          <span style={{ position: "absolute", top: -6, right: -8, height: 15, width: 15, borderRadius: 999, background: COLORS.red, color: COLORS.white, fontSize: 9, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center" }}>
+            {badge > 9 ? "9+" : badge}
+          </span>
+        )}
+      </span>
       <span style={{ fontSize: 10, fontWeight: 600, color: active ? COLORS.green : COLORS.ink40 }}>{label}</span>
     </button>
   );
@@ -803,7 +1180,7 @@ function NavItem({ icon: Icon, label, active, onClick }) {
 
 /* ---------------- Dashboard Screen ---------------- */
 
-function DashboardScreen({ floatBal, totalFloat, cashOnHand, todayStats, transactions, lowFloatNetworks, permissions, setActiveModal, setScreen, setReceipt, showToast }) {
+function DashboardScreen({ floatBal, totalFloat, cashOnHand, todayStats, transactions, lowFloatNetworks, permissions, pendingApprovalsCount, subscriptionStatus, setActiveModal, setScreen, setReceipt, showToast }) {
   return (
     <>
       {/* Float strip */}
@@ -903,6 +1280,20 @@ function DashboardScreen({ floatBal, totalFloat, cashOnHand, todayStats, transac
 
       {/* Settings entry points */}
       <section style={{ padding: "20px 16px 0", display: "flex", flexDirection: "column", gap: 10 }}>
+        {permissions.includes("approvals") && (
+          <button onClick={() => setScreen("approvals")} style={{ width: "100%", display: "flex", alignItems: "center", gap: 12, borderRadius: 16, background: pendingApprovalsCount > 0 ? COLORS.goldSoft : COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: "14px", border: "none", textAlign: "left" }}>
+            <span style={{ display: "flex", height: 36, width: 36, alignItems: "center", justifyContent: "center", borderRadius: 999, background: pendingApprovalsCount > 0 ? COLORS.gold : COLORS.ink08 }}>
+              <Clock size={16} color={pendingApprovalsCount > 0 ? COLORS.ink : COLORS.ink70} />
+            </span>
+            <span style={{ flex: 1 }}>
+              <span style={{ display: "block", fontSize: 13.5, fontWeight: 600 }}>Pending Approvals</span>
+              {pendingApprovalsCount > 0 && (
+                <span style={{ display: "block", fontSize: 11, color: COLORS.ink60, marginTop: 1 }}>{pendingApprovalsCount} registration{pendingApprovalsCount !== 1 ? "s" : ""} awaiting review</span>
+              )}
+            </span>
+            <ChevronRight size={16} color={COLORS.ink40} />
+          </button>
+        )}
         {permissions.includes("float") && (
           <button onClick={() => setScreen("float")} style={{ width: "100%", display: "flex", alignItems: "center", gap: 12, borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: "14px", border: "none", textAlign: "left" }}>
             <span style={{ display: "flex", height: 36, width: 36, alignItems: "center", justifyContent: "center", borderRadius: 999, background: COLORS.ink08 }}>
@@ -918,6 +1309,24 @@ function DashboardScreen({ floatBal, totalFloat, cashOnHand, todayStats, transac
               <Settings2 size={16} color={COLORS.ink70} />
             </span>
             <span style={{ flex: 1, fontSize: 13.5, fontWeight: 600 }}>Commission Rate Settings</span>
+            <ChevronRight size={16} color={COLORS.ink40} />
+          </button>
+        )}
+        {permissions.includes("subscription") && (
+          <button onClick={() => setScreen("subscription")} style={{ width: "100%", display: "flex", alignItems: "center", gap: 12, borderRadius: 16, background: subscriptionStatus && subscriptionStatus.status !== "active" ? COLORS.redSoft : COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: "14px", border: "none", textAlign: "left" }}>
+            <span style={{ display: "flex", height: 36, width: 36, alignItems: "center", justifyContent: "center", borderRadius: 999, background: subscriptionStatus && subscriptionStatus.status !== "active" ? COLORS.red : COLORS.ink08 }}>
+              <CreditCard size={16} color={subscriptionStatus && subscriptionStatus.status !== "active" ? COLORS.white : COLORS.ink70} />
+            </span>
+            <span style={{ flex: 1 }}>
+              <span style={{ display: "block", fontSize: 13.5, fontWeight: 600 }}>Subscription</span>
+              {subscriptionStatus && (
+                <span style={{ display: "block", fontSize: 11, color: subscriptionStatus.status !== "active" ? COLORS.red : COLORS.ink60, marginTop: 1 }}>
+                  {subscriptionStatus.status === "active" && subscriptionStatus.daysRemaining !== null && `${subscriptionStatus.daysRemaining} day${subscriptionStatus.daysRemaining !== 1 ? "s" : ""} remaining`}
+                  {subscriptionStatus.status === "grace_period" && "Grace period — renew now"}
+                  {subscriptionStatus.status === "suspended" && "Suspended — renew to restore access"}
+                </span>
+              )}
+            </span>
             <ChevronRight size={16} color={COLORS.ink40} />
           </button>
         )}
@@ -958,12 +1367,28 @@ function ActionButton({ icon: Icon, label, tone, onClick }) {
 
 function LoginScreen({ api, onLogin }) {
   const [mode, setMode] = useState("signin"); // "signin" | "register"
+  const [signInMethod, setSignInMethod] = useState("email"); // "email" (Business Owner) | "pin" (Agent/Manager)
   const [businessName, setBusinessName] = useState("");
   const [fullName, setFullName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [businessRegNumber, setBusinessRegNumber] = useState("");
   const [phone, setPhone] = useState("");
   const [pin, setPin] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [pendingApproval, setPendingApproval] = useState(null); // set after successful registration
+
+  // Forgot-password mini-flow
+  const [showForgotPassword, setShowForgotPassword] = useState(false);
+  const [resetEmail, setResetEmail] = useState("");
+  const [resetToken, setResetToken] = useState("");
+  const [resetNewPassword, setResetNewPassword] = useState("");
+  const [resetStage, setResetStage] = useState("request"); // "request" | "confirm" | "done"
+  const [resetMessage, setResetMessage] = useState("");
+  const [resetError, setResetError] = useState("");
+  const [resetLoading, setResetLoading] = useState(false);
 
   // A stable per-installation identifier for device binding. crypto.
   // randomUUID() generates a fresh one each page load in this
@@ -978,9 +1403,43 @@ function LoginScreen({ api, onLogin }) {
     setMode(next);
     setError("");
     setPin("");
+    setPendingApproval(null);
   }
 
   async function handleSignIn() {
+    if (signInMethod === "email") {
+      if (email.trim().length === 0) {
+        setError("Enter your email address.");
+        return;
+      }
+      if (password.length === 0) {
+        setError("Enter your password.");
+        return;
+      }
+      setLoading(true);
+      setError("");
+      try {
+        const result = await api.login(email.trim(), password, deviceIdRef.current);
+        onLogin(result.user, result.accessToken, result.subscriptionWarning);
+      } catch (err) {
+        if (err.isNetworkError) {
+          setError(`Can't reach the server at ${API_BASE_URL}. Is the backend running and reachable from this app?`);
+        } else if (err.status === 401) {
+          setError("Incorrect email or password.");
+        } else if (err.status === 403) {
+          // Organization is pending_approval / suspended / rejected —
+          // the backend's message already explains which, and why.
+          setError(err.body?.message || "Your account isn't active yet.");
+        } else {
+          setError(err.message || "Sign in failed.");
+        }
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
+    // PIN sign-in path, for Agent/Manager accounts
     if (phone.trim().length === 0) {
       setError("Enter your phone number.");
       return;
@@ -993,7 +1452,7 @@ function LoginScreen({ api, onLogin }) {
     setError("");
     try {
       const result = await api.pinLogin(phone.trim(), pin, deviceIdRef.current);
-      onLogin(result.user, result.accessToken);
+      onLogin(result.user, result.accessToken, result.subscriptionWarning);
     } catch (err) {
       if (err.isNetworkError) {
         setError(`Can't reach the server at ${API_BASE_URL}. Is the backend running and reachable from this app?`);
@@ -1017,30 +1476,106 @@ function LoginScreen({ api, onLogin }) {
       setError("Enter your full name.");
       return;
     }
-    if (!/^0\d{9}$/.test(phone.trim())) {
-      setError("Enter a valid 10-digit phone number starting with 0 (e.g. 0244123456).");
+    if (!/^\S+@\S+\.\S+$/.test(email.trim())) {
+      setError("Enter a valid email address.");
       return;
     }
-    if (pin.length !== 4) {
-      setError("Choose a 4-digit PIN.");
+    if (password.length < 8) {
+      setError("Choose a password with at least 8 characters.");
+      return;
+    }
+    if (password !== confirmPassword) {
+      setError("Passwords don't match.");
+      return;
+    }
+    if (!/^0\d{9}$/.test(phone.trim())) {
+      setError("Enter a valid 10-digit phone number starting with 0 (e.g. 0244123456).");
       return;
     }
     setLoading(true);
     setError("");
     try {
-      const result = await api.register(businessName.trim(), fullName.trim(), phone.trim(), pin, deviceIdRef.current);
-      onLogin(result.user, result.accessToken);
+      const result = await api.register(
+        businessName.trim(),
+        fullName.trim(),
+        email.trim(),
+        password,
+        phone.trim(),
+        businessRegNumber.trim(),
+        deviceIdRef.current,
+      );
+      // Registration no longer signs the user in directly — the
+      // account sits in pending_approval until a Superuser confirms
+      // the subscription payment. Show that state instead of
+      // dropping straight into the dashboard.
+      setPendingApproval(result);
     } catch (err) {
       if (err.isNetworkError) {
         setError(`Can't reach the server at ${API_BASE_URL}. Is the backend running and reachable from this app?`);
       } else if (err.status === 409) {
-        setError("An account with this phone number already exists. Try signing in instead.");
+        setError(err.body?.message || "An account with this email or phone number already exists. Try signing in instead.");
       } else {
         setError(err.message || "Registration failed.");
       }
     } finally {
       setLoading(false);
     }
+  }
+
+  async function handleRequestReset() {
+    if (!/^\S+@\S+\.\S+$/.test(resetEmail.trim())) {
+      setResetError("Enter a valid email address.");
+      return;
+    }
+    setResetLoading(true);
+    setResetError("");
+    try {
+      const result = await api.requestPasswordReset(resetEmail.trim());
+      setResetMessage(result.message);
+      // The backend hands back the raw token directly for now, since
+      // no transactional email provider is wired up yet — see
+      // PasswordResetService. Once email sending exists, this token
+      // field will stop being returned and this pre-fill goes away
+      // naturally (the input stays, just empty).
+      if (result.token) setResetToken(result.token);
+      setResetStage("confirm");
+    } catch (err) {
+      setResetError(err.isNetworkError ? "Can't reach the server." : err.message || "Something went wrong.");
+    } finally {
+      setResetLoading(false);
+    }
+  }
+
+  async function handleConfirmReset() {
+    if (resetToken.trim().length === 0) {
+      setResetError("Enter the reset token from your email.");
+      return;
+    }
+    if (resetNewPassword.length < 8) {
+      setResetError("Choose a password with at least 8 characters.");
+      return;
+    }
+    setResetLoading(true);
+    setResetError("");
+    try {
+      const result = await api.resetPassword(resetToken.trim(), resetNewPassword);
+      setResetMessage(result.message);
+      setResetStage("done");
+    } catch (err) {
+      setResetError(err.isNetworkError ? "Can't reach the server." : err.message || "That reset link is invalid or has expired.");
+    } finally {
+      setResetLoading(false);
+    }
+  }
+
+  function closeForgotPassword() {
+    setShowForgotPassword(false);
+    setResetStage("request");
+    setResetEmail("");
+    setResetToken("");
+    setResetNewPassword("");
+    setResetMessage("");
+    setResetError("");
   }
 
   function handleDigit(d) {
@@ -1061,6 +1596,43 @@ function LoginScreen({ api, onLogin }) {
     boxSizing: "border-box",
     outline: "none",
   };
+
+  // After a successful registration, show the pending-approval state
+  // instead of the sign-in/register form — there's no token to log in
+  // with yet, and the person needs clear next steps (pay, submit
+  // reference, wait for approval).
+  if (pendingApproval) {
+    return (
+      <div style={{ width: "100%", minHeight: 600, background: COLORS.green, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "24px 24px", color: COLORS.white, fontFamily: "sans-serif", textAlign: "center" }}>
+        <div style={{ height: 56, width: 56, borderRadius: 999, background: "rgba(255,255,255,0.12)", display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 16 }}>
+          <Clock size={26} color={COLORS.gold} />
+        </div>
+        <h1 style={{ fontSize: 20, fontWeight: 700, marginBottom: 10 }}>Registration submitted</h1>
+        <p style={{ fontSize: 13.5, color: COLORS.white70, lineHeight: 1.5, marginBottom: 20, maxWidth: 280 }}>
+          {pendingApproval.message}
+        </p>
+        <div style={{ width: "100%", maxWidth: 280, borderRadius: 12, background: "rgba(255,255,255,0.1)", padding: 14, marginBottom: 20, textAlign: "left" }}>
+          <p style={{ fontSize: 12, fontWeight: 700, color: COLORS.gold, marginBottom: 6 }}>Next steps</p>
+          <p style={{ fontSize: 12.5, color: COLORS.white70, lineHeight: 1.5, margin: 0 }}>
+            1. Pay your subscription fee via MTN MoMo to the AgentPro Ghana merchant number.{"\n"}
+            2. Submit your payment reference in-app once approved contact allows sign-in.{"\n"}
+            3. A Superuser will verify payment and activate your account — you'll be able to sign in with your email and password once that's done.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => {
+            setPendingApproval(null);
+            setMode("signin");
+            setSignInMethod("email");
+          }}
+          style={{ borderRadius: 12, background: COLORS.gold, color: COLORS.ink, fontWeight: 700, padding: "12px 24px", fontSize: 13.5, border: "none" }}
+        >
+          Back to sign in
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div style={{ width: "100%", minHeight: 600, background: COLORS.green, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "24px 24px", color: COLORS.white, fontFamily: "sans-serif" }}>
@@ -1088,82 +1660,85 @@ function LoginScreen({ api, onLogin }) {
       </div>
 
       <div style={{ width: "100%", maxWidth: 280 }}>
+        {mode === "signin" && (
+          <div style={{ display: "flex", justifyContent: "center", gap: 16, marginBottom: 16 }}>
+            <button
+              type="button"
+              onClick={() => { setSignInMethod("email"); setError(""); }}
+              style={{ background: "none", border: "none", padding: 0, fontSize: 11.5, fontWeight: 700, color: signInMethod === "email" ? COLORS.gold : "rgba(255,255,255,0.5)", borderBottom: signInMethod === "email" ? `2px solid ${COLORS.gold}` : "2px solid transparent", paddingBottom: 4 }}
+            >
+              Business Owner
+            </button>
+            <button
+              type="button"
+              onClick={() => { setSignInMethod("pin"); setError(""); }}
+              style={{ background: "none", border: "none", padding: 0, fontSize: 11.5, fontWeight: 700, color: signInMethod === "pin" ? COLORS.gold : "rgba(255,255,255,0.5)", borderBottom: signInMethod === "pin" ? `2px solid ${COLORS.gold}` : "2px solid transparent", paddingBottom: 4 }}
+            >
+              Agent / Manager (PIN)
+            </button>
+          </div>
+        )}
+
         {mode === "register" && (
           <>
-            <input
-              type="text"
-              value={businessName}
-              onChange={(e) => setBusinessName(e.target.value)}
-              placeholder="Business name"
-              style={inputStyle}
-            />
-            <input
-              type="text"
-              value={fullName}
-              onChange={(e) => setFullName(e.target.value)}
-              placeholder="Your full name"
-              style={inputStyle}
-            />
+            <input type="text" value={businessName} onChange={(e) => setBusinessName(e.target.value)} placeholder="Business name" style={inputStyle} />
+            <input type="text" value={fullName} onChange={(e) => setFullName(e.target.value)} placeholder="Your full name" style={inputStyle} />
           </>
         )}
 
-        <input
-          type="tel"
-          value={phone}
-          onChange={(e) => setPhone(e.target.value)}
-          placeholder="Phone number (e.g. 0244123456)"
-          style={inputStyle}
-        />
+        {(mode === "register" || signInMethod === "email") && (
+          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email address" style={inputStyle} autoCapitalize="none" />
+        )}
 
-        <p style={{ fontSize: 11, color: COLORS.white65, marginBottom: 8, textAlign: "center" }}>
-          {mode === "signin" ? "Enter your PIN" : "Choose a 4-digit PIN"}
-        </p>
+        {(mode === "register" || signInMethod === "pin") && (
+          <input type="tel" value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="Phone number (e.g. 0244123456)" style={inputStyle} />
+        )}
 
-        <div style={{ display: "flex", gap: 12, marginBottom: 12, justifyContent: "center" }}>
-          {[0, 1, 2, 3].map((i) => (
-            <span
-              key={i}
-              style={{
-                height: 14,
-                width: 14,
-                borderRadius: 999,
-                border: "2px solid rgba(255,255,255,0.4)",
-                background: pin.length > i ? COLORS.white : "transparent",
-                display: "inline-block",
-              }}
-            />
-          ))}
-        </div>
+        {mode === "register" && (
+          <input type="text" value={businessRegNumber} onChange={(e) => setBusinessRegNumber(e.target.value)} placeholder="Ghana Card or business reg. number (optional)" style={inputStyle} />
+        )}
+
+        {(mode === "register" || signInMethod === "email") && (
+          <>
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={mode === "register" ? "Choose a password (min. 8 characters)" : "Password"} style={inputStyle} />
+            {mode === "register" && (
+              <input type="password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} placeholder="Confirm password" style={inputStyle} />
+            )}
+          </>
+        )}
+
+        {mode === "signin" && signInMethod === "pin" && (
+          <>
+            <p style={{ fontSize: 11, color: COLORS.white65, marginBottom: 8, textAlign: "center" }}>Enter your PIN</p>
+            <div style={{ display: "flex", gap: 12, marginBottom: 12, justifyContent: "center" }}>
+              {[0, 1, 2, 3].map((i) => (
+                <span key={i} style={{ height: 14, width: 14, borderRadius: 999, border: "2px solid rgba(255,255,255,0.4)", background: pin.length > i ? COLORS.white : "transparent", display: "inline-block" }} />
+              ))}
+            </div>
+          </>
+        )}
 
         <p style={{ minHeight: 20, fontSize: 12.5, color: "#F4B8A0", fontWeight: 500, marginBottom: 8, textAlign: "center" }}>{error}</p>
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, width: "100%" }}>
-          {["1", "2", "3", "4", "5", "6", "7", "8", "9", "", "0", "del"].map((key, i) => {
-            if (key === "") return <div key={i} />;
-            if (key === "del") {
+        {mode === "signin" && signInMethod === "pin" && (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, width: "100%" }}>
+            {["1", "2", "3", "4", "5", "6", "7", "8", "9", "", "0", "del"].map((key, i) => {
+              if (key === "") return <div key={i} />;
+              if (key === "del") {
+                return (
+                  <button type="button" key={i} onClick={() => setPin((p) => p.slice(0, -1))} style={{ height: 56, borderRadius: 16, background: "rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 600, color: COLORS.white, border: "none" }}>
+                    Delete
+                  </button>
+                );
+              }
               return (
-                <button
-                  type="button"
-                  key={i}
-                  onClick={() => setPin((p) => p.slice(0, -1))}
-                  style={{ height: 56, borderRadius: 16, background: "rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 600, color: COLORS.white, border: "none" }}
-                >
-                  Delete
+                <button type="button" key={i} onClick={() => handleDigit(key)} style={{ height: 56, borderRadius: 16, background: "rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 19, fontWeight: 700, color: COLORS.white, border: "none" }}>
+                  {key}
                 </button>
               );
-            }
-            return (
-              <button
-                type="button"
-                key={i}
-                onClick={() => handleDigit(key)}
-                style={{ height: 56, borderRadius: 16, background: "rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 19, fontWeight: 700, color: COLORS.white, border: "none" }}
-              >
-                {key}
-              </button>
-            );
-          })}
-        </div>
+            })}
+          </div>
+        )}
 
         <button
           type="button"
@@ -1173,6 +1748,16 @@ function LoginScreen({ api, onLogin }) {
         >
           {loading ? (mode === "signin" ? "Signing in..." : "Creating account...") : mode === "signin" ? "Sign in" : "Create account"}
         </button>
+
+        {mode === "signin" && signInMethod === "email" && (
+          <button
+            type="button"
+            onClick={() => setShowForgotPassword(true)}
+            style={{ width: "100%", marginTop: 12, background: "none", border: "none", fontSize: 12, color: "rgba(255,255,255,0.65)", textDecoration: "underline" }}
+          >
+            Forgot password?
+          </button>
+        )}
       </div>
 
       <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 24, color: "rgba(255,255,255,0.45)" }}>
@@ -1181,6 +1766,52 @@ function LoginScreen({ api, onLogin }) {
           Connecting to {API_BASE_URL}
         </p>
       </div>
+
+      {showForgotPassword && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "flex", alignItems: "center", justifyContent: "center", padding: 24, zIndex: 50 }}>
+          <div style={{ width: "100%", maxWidth: 300, background: COLORS.white, borderRadius: 16, padding: 20, color: COLORS.ink }}>
+            <h2 style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Reset your password</h2>
+
+            {resetStage === "request" && (
+              <>
+                <p style={{ fontSize: 12.5, color: COLORS.ink60, marginBottom: 14 }}>Enter the email on your account and we'll send a reset link.</p>
+                <input type="email" value={resetEmail} onChange={(e) => setResetEmail(e.target.value)} placeholder="Email address" style={{ width: "100%", borderRadius: 10, border: `1px solid ${COLORS.ink12}`, padding: "10px 12px", fontSize: 13.5, marginBottom: 10, boxSizing: "border-box" }} />
+                {resetError && <p style={{ fontSize: 12, color: "#C0392B", marginBottom: 8 }}>{resetError}</p>}
+                <button type="button" onClick={handleRequestReset} disabled={resetLoading} style={{ width: "100%", borderRadius: 10, background: COLORS.green, color: COLORS.white, fontWeight: 700, padding: "11px 0", fontSize: 13.5, border: "none", marginBottom: 8, opacity: resetLoading ? 0.6 : 1 }}>
+                  {resetLoading ? "Sending..." : "Send reset link"}
+                </button>
+              </>
+            )}
+
+            {resetStage === "confirm" && (
+              <>
+                <p style={{ fontSize: 12.5, color: COLORS.ink60, marginBottom: 14 }}>{resetMessage}</p>
+                <input type="text" value={resetToken} onChange={(e) => setResetToken(e.target.value)} placeholder="Reset token from email" style={{ width: "100%", borderRadius: 10, border: `1px solid ${COLORS.ink12}`, padding: "10px 12px", fontSize: 13.5, marginBottom: 10, boxSizing: "border-box" }} />
+                <input type="password" value={resetNewPassword} onChange={(e) => setResetNewPassword(e.target.value)} placeholder="New password (min. 8 characters)" style={{ width: "100%", borderRadius: 10, border: `1px solid ${COLORS.ink12}`, padding: "10px 12px", fontSize: 13.5, marginBottom: 10, boxSizing: "border-box" }} />
+                {resetError && <p style={{ fontSize: 12, color: "#C0392B", marginBottom: 8 }}>{resetError}</p>}
+                <button type="button" onClick={handleConfirmReset} disabled={resetLoading} style={{ width: "100%", borderRadius: 10, background: COLORS.green, color: COLORS.white, fontWeight: 700, padding: "11px 0", fontSize: 13.5, border: "none", marginBottom: 8, opacity: resetLoading ? 0.6 : 1 }}>
+                  {resetLoading ? "Resetting..." : "Reset password"}
+                </button>
+              </>
+            )}
+
+            {resetStage === "done" && (
+              <>
+                <p style={{ fontSize: 12.5, color: COLORS.ink60, marginBottom: 14 }}>{resetMessage}</p>
+                <button type="button" onClick={closeForgotPassword} style={{ width: "100%", borderRadius: 10, background: COLORS.green, color: COLORS.white, fontWeight: 700, padding: "11px 0", fontSize: 13.5, border: "none", marginBottom: 8 }}>
+                  Done
+                </button>
+              </>
+            )}
+
+            {resetStage !== "done" && (
+              <button type="button" onClick={closeForgotPassword} style={{ width: "100%", background: "none", border: "none", fontSize: 12.5, color: COLORS.ink60, padding: "6px 0" }}>
+                Cancel
+              </button>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1441,33 +2072,79 @@ function nestedRatesToUpdatePayload(nested) {
   return payload;
 }
 
-function CommissionsScreen({ rates, api, showToast, onSaved }) {
+function CommissionsScreen({ rates, api, showToast, onSaved, role, setScreen }) {
   const [draft, setDraft] = useState(() => ratesArrayToNested(rates));
   const [saving, setSaving] = useState(false);
+  const [myRequests, setMyRequests] = useState([]);
   const labels = { cash_in: "Cash-In", cash_out: "Cash-Out", airtime: "Airtime", data_bundle: "Data Bundle" };
+  const isOwner = role === "business_owner";
 
   useEffect(() => {
     setDraft(ratesArrayToNested(rates));
   }, [rates]);
+
+  useEffect(() => {
+    if (!isOwner) return;
+    api
+      .listMyCommissionRateRequests()
+      .then((data) => setMyRequests(data.filter((r) => r.status === "pending")))
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOwner]);
+
+  function pendingRequestFor(network, transactionType) {
+    return myRequests.find((r) => r.network === network && r.transactionType === transactionType);
+  }
 
   function updateRate(network, key, pctValue) {
     const numeric = Math.max(0, parseFloat(pctValue) || 0);
     setDraft((prev) => ({ ...prev, [network]: { ...prev[network], [key]: numeric } }));
   }
 
+  // Business Owners can no longer update rates directly (spec section
+  // 8: custom rates require Superuser approval) — "Save" now submits
+  // one request per changed rate instead of one bulk PUT. Note: this
+  // simple screen only edits the flat rate percentage; a rate that
+  // already has an approved tiering/cap/provider-share configured
+  // keeps that configuration untouched unless a more advanced request
+  // is submitted through support — this screen doesn't yet expose
+  // those fields for editing.
   async function handleSave() {
+    const original = ratesArrayToNested(rates);
+    const changed = [];
+    for (const network of Object.keys(draft)) {
+      for (const key of RATE_FIELD_KEYS) {
+        const before = (original[network] && original[network][key]) || 0;
+        const after = (draft[network] && draft[network][key]) || 0;
+        if (before !== after) changed.push({ network, transactionType: key, ratePercent: after });
+      }
+    }
+
+    if (changed.length === 0) {
+      showToast("No changes to submit");
+      return;
+    }
+
     setSaving(true);
     try {
-      await api.updateCommissionRates(nestedRatesToUpdatePayload(draft));
-      showToast("Commission rates updated");
+      for (const item of changed) {
+        await api.requestCommissionRate(item);
+      }
+      showToast(
+        changed.length === 1
+          ? "Rate change submitted for Superuser review"
+          : `${changed.length} rate changes submitted for Superuser review`,
+      );
+      const refreshed = await api.listMyCommissionRateRequests();
+      setMyRequests(refreshed.filter((r) => r.status === "pending"));
       onSaved();
     } catch (err) {
       if (err.isNetworkError) {
-        showToast("Can't reach the server — rate changes need a live connection");
+        showToast("Can't reach the server — rate requests need a live connection");
       } else if (err.status === 403) {
-        showToast("Your role doesn't have permission to change commission rates");
+        showToast("Your role doesn't have permission to request rate changes");
       } else {
-        showToast(err.message || "Failed to update rates");
+        showToast(err.message || "Failed to submit rate change request");
       }
     } finally {
       setSaving(false);
@@ -1487,10 +2164,48 @@ function CommissionsScreen({ rates, api, showToast, onSaved }) {
     );
   }
 
+  if (!isOwner) {
+    // Super Admin / other roles see rates read-only here — direct
+    // per-business rate overrides and reviewing custom-rate requests
+    // both happen from the Approvals screen, which already has the
+    // cross-organization review pattern built for exactly this kind
+    // of Superuser action.
+    return (
+      <div style={{ padding: "16px 16px 16px" }}>
+        <p style={{ fontSize: 12.5, color: COLORS.ink55, marginBottom: 16 }}>
+          Rates shown are what's currently active for your branch. To review and approve custom-rate requests from businesses, use Approvals.
+        </p>
+        {Object.entries(NETWORKS).map(([netKey, net]) => (
+          <div key={netKey} style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: 14, marginBottom: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12 }}>
+              <span style={{ height: 10, width: 10, borderRadius: 999, background: net.dot, display: "inline-block" }} />
+              <p style={{ fontSize: 13.5, fontWeight: 700, margin: 0 }}>{net.label}</p>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              {Object.entries(labels).map(([key, label]) => (
+                <div key={key}>
+                  <label style={{ display: "block", fontSize: 10.5, fontWeight: 600, textTransform: "uppercase", color: COLORS.ink40, marginBottom: 4 }}>{label}</label>
+                  <div style={{ borderRadius: 12, border: `1px solid ${COLORS.ink12}`, background: COLORS.cream, padding: "8px 10px", fontSize: 13.5, fontWeight: 700 }}>
+                    {((draft[netKey] && draft[netKey][key]) || 0).toFixed(2)}%
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+        {setScreen && (
+          <button onClick={() => setScreen("approvals")} style={{ width: "100%", marginTop: 8, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, borderRadius: 12, background: COLORS.green, color: COLORS.white, padding: "12px 0", fontSize: 13, fontWeight: 700, border: "none" }}>
+            Go to Approvals
+          </button>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div style={{ padding: "16px 16px 16px" }}>
       <p style={{ fontSize: 12.5, color: COLORS.ink55, marginBottom: 16 }}>
-        Set the commission percentage your shop earns per transaction type, by network. Changes apply to new transactions immediately.
+        Propose the commission percentage your shop earns per transaction type, by network. Changes are submitted to a Superuser for approval before they take effect.
       </p>
 
       {Object.entries(NETWORKS).map(([netKey, net]) => (
@@ -1500,22 +2215,30 @@ function CommissionsScreen({ rates, api, showToast, onSaved }) {
             <p style={{ fontSize: 13.5, fontWeight: 700, margin: 0 }}>{net.label}</p>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-            {Object.entries(labels).map(([key, label]) => (
-              <div key={key}>
-                <label style={{ display: "block", fontSize: 10.5, fontWeight: 600, textTransform: "uppercase", color: COLORS.ink40, marginBottom: 4 }}>{label}</label>
-                <div style={{ display: "flex", alignItems: "center", borderRadius: 12, border: `1px solid ${COLORS.ink12}`, background: COLORS.cream, padding: "8px 10px" }}>
-                  <input
-                    type="number"
-                    step="0.01"
-                    min="0"
-                    value={(draft[netKey] && draft[netKey][key] !== undefined ? draft[netKey][key] : 0).toFixed(2)}
-                    onChange={(e) => updateRate(netKey, key, e.target.value)}
-                    style={{ width: "100%", background: "transparent", fontSize: 13.5, fontWeight: 700, border: "none", outline: "none" }}
-                  />
-                  <span style={{ fontSize: 12, color: COLORS.ink40, fontWeight: 600 }}>%</span>
+            {Object.entries(labels).map(([key, label]) => {
+              const pending = pendingRequestFor(netKey, key);
+              return (
+                <div key={key}>
+                  <label style={{ display: "block", fontSize: 10.5, fontWeight: 600, textTransform: "uppercase", color: COLORS.ink40, marginBottom: 4 }}>{label}</label>
+                  <div style={{ display: "flex", alignItems: "center", borderRadius: 12, border: `1px solid ${COLORS.ink12}`, background: COLORS.cream, padding: "8px 10px" }}>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      value={(draft[netKey] && draft[netKey][key] !== undefined ? draft[netKey][key] : 0).toFixed(2)}
+                      onChange={(e) => updateRate(netKey, key, e.target.value)}
+                      style={{ width: "100%", background: "transparent", fontSize: 13.5, fontWeight: 700, border: "none", outline: "none" }}
+                    />
+                    <span style={{ fontSize: 12, color: COLORS.ink40, fontWeight: 600 }}>%</span>
+                  </div>
+                  {pending && (
+                    <p style={{ fontSize: 10, color: COLORS.gold, fontWeight: 600, marginTop: 3 }}>
+                      {pending.ratePercent.toFixed(2)}% pending review
+                    </p>
+                  )}
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       ))}
@@ -1525,7 +2248,7 @@ function CommissionsScreen({ rates, api, showToast, onSaved }) {
           <RotateCcw size={14} /> Reset
         </button>
         <button onClick={handleSave} disabled={saving} style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, borderRadius: 12, background: COLORS.green, color: COLORS.white, padding: "12px 0", fontSize: 13, fontWeight: 700, border: "none", opacity: saving ? 0.6 : 1 }}>
-          <Save size={14} /> {saving ? "Saving..." : "Save changes"}
+          <Save size={14} /> {saving ? "Submitting..." : "Submit for approval"}
         </button>
       </div>
     </div>
@@ -1633,6 +2356,1232 @@ function SupportScreen({ tickets, api, onReload, showToast }) {
           </button>
         ))}
       </div>
+    </div>
+  );
+}
+
+/* ---------------- Superuser Approvals Screen ---------------- */
+
+function ApprovalsScreen({ organizations, onReload, commissionRequests, onReloadCommissionRequests, renewals, onReloadRenewals, hubListings, onReloadHubListings, hubPayments, onReloadHubPayments, api, showToast }) {
+  const [tab, setTab] = useState("registrations"); // "registrations" | "commissions" | "renewals" | "hubListings" | "hubPayments"
+  const [actionTarget, setActionTarget] = useState(null); // { org, kind: "approve" | "reject" }
+  const [commissionActionTarget, setCommissionActionTarget] = useState(null); // { request, kind }
+  const [renewalActionTarget, setRenewalActionTarget] = useState(null); // { payment, kind }
+  const [hubListingActionTarget, setHubListingActionTarget] = useState(null); // { listing, kind }
+  const [hubPaymentActionTarget, setHubPaymentActionTarget] = useState(null); // { payment, kind }
+  const [submitting, setSubmitting] = useState(false);
+
+  async function handleApprove(org, paymentReference) {
+    setSubmitting(true);
+    try {
+      await api.approveOrganization(org.id, paymentReference);
+      showToast(`${org.name} approved and activated`);
+      setActionTarget(null);
+      onReload();
+    } catch (err) {
+      if (err.isNetworkError) showToast("Can't reach the server — try again once you're back online");
+      else showToast(err.message || "Failed to approve organization");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleReject(org, reason) {
+    setSubmitting(true);
+    try {
+      await api.rejectOrganization(org.id, reason);
+      showToast(`${org.name} registration rejected`);
+      setActionTarget(null);
+      onReload();
+    } catch (err) {
+      if (err.isNetworkError) showToast("Can't reach the server — try again once you're back online");
+      else showToast(err.message || "Failed to reject organization");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleApproveCommissionRequest(request) {
+    setSubmitting(true);
+    try {
+      await api.approveCommissionRateRequest(request.id);
+      showToast(`${request.organizationName}'s rate change approved and applied`);
+      setCommissionActionTarget(null);
+      onReloadCommissionRequests();
+    } catch (err) {
+      if (err.isNetworkError) showToast("Can't reach the server — try again once you're back online");
+      else showToast(err.message || "Failed to approve rate request");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleRejectCommissionRequest(request, reason) {
+    setSubmitting(true);
+    try {
+      await api.rejectCommissionRateRequest(request.id, reason);
+      showToast(`${request.organizationName}'s rate request rejected`);
+      setCommissionActionTarget(null);
+      onReloadCommissionRequests();
+    } catch (err) {
+      if (err.isNetworkError) showToast("Can't reach the server — try again once you're back online");
+      else showToast(err.message || "Failed to reject rate request");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleVerifyRenewal(payment) {
+    setSubmitting(true);
+    try {
+      await api.verifyRenewalPayment(payment.id);
+      showToast(`${payment.organizationName}'s renewal verified — subscription extended`);
+      setRenewalActionTarget(null);
+      onReloadRenewals();
+    } catch (err) {
+      if (err.isNetworkError) showToast("Can't reach the server — try again once you're back online");
+      else showToast(err.message || "Failed to verify renewal payment");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleRejectRenewal(payment, reason) {
+    setSubmitting(true);
+    try {
+      await api.rejectRenewalPayment(payment.id, reason);
+      showToast(`${payment.organizationName}'s renewal payment rejected`);
+      setRenewalActionTarget(null);
+      onReloadRenewals();
+    } catch (err) {
+      if (err.isNetworkError) showToast("Can't reach the server — try again once you're back online");
+      else showToast(err.message || "Failed to reject renewal payment");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleApproveHubListing(listing) {
+    setSubmitting(true);
+    try {
+      const result = await api.approveBusinessHubListingContent(listing.id);
+      showToast(`"${listing.title}" approved — fee GH₵${result.feeGhs.toFixed(2)}`);
+      setHubListingActionTarget(null);
+      onReloadHubListings();
+    } catch (err) {
+      if (err.isNetworkError) showToast("Can't reach the server — try again once you're back online");
+      else showToast(err.message || "Failed to approve listing");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleRejectHubListing(listing, reason) {
+    setSubmitting(true);
+    try {
+      await api.rejectBusinessHubListingContent(listing.id, reason);
+      showToast(`"${listing.title}" rejected`);
+      setHubListingActionTarget(null);
+      onReloadHubListings();
+    } catch (err) {
+      if (err.isNetworkError) showToast("Can't reach the server — try again once you're back online");
+      else showToast(err.message || "Failed to reject listing");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleVerifyHubPayment(payment) {
+    setSubmitting(true);
+    try {
+      await api.verifyBusinessHubListingPayment(payment.id);
+      showToast(`"${payment.listingTitle}" published`);
+      setHubPaymentActionTarget(null);
+      onReloadHubPayments();
+    } catch (err) {
+      if (err.isNetworkError) showToast("Can't reach the server — try again once you're back online");
+      else showToast(err.message || "Failed to verify payment");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleRejectHubPayment(payment, reason) {
+    setSubmitting(true);
+    try {
+      await api.rejectBusinessHubListingPayment(payment.id, reason);
+      showToast(`Payment for "${payment.listingTitle}" rejected`);
+      setHubPaymentActionTarget(null);
+      onReloadHubPayments();
+    } catch (err) {
+      if (err.isNetworkError) showToast("Can't reach the server — try again once you're back online");
+      else showToast(err.message || "Failed to reject payment");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const rateFieldLabel = { cash_in: "Cash-In", cash_out: "Cash-Out", airtime: "Airtime", data_bundle: "Data Bundle", send_money: "Send Money", bill_payment: "Bill Payment", merchant_payment: "Merchant Payment" };
+
+  return (
+    <div style={{ padding: "16px 16px 16px" }}>
+      <div style={{ display: "flex", gap: 4, borderRadius: 12, background: COLORS.ink06, padding: 4, marginBottom: 16, overflowX: "auto" }}>
+        <button
+          type="button"
+          onClick={() => setTab("registrations")}
+          style={{ flexShrink: 0, padding: "8px 12px", borderRadius: 9, border: "none", fontSize: 11.5, fontWeight: 700, whiteSpace: "nowrap", background: tab === "registrations" ? COLORS.white : "transparent", color: tab === "registrations" ? COLORS.ink : COLORS.ink55, boxShadow: tab === "registrations" ? "0 1px 3px rgba(0,0,0,0.08)" : "none" }}
+        >
+          Registrations {organizations.length > 0 && `(${organizations.length})`}
+        </button>
+        <button
+          type="button"
+          onClick={() => setTab("commissions")}
+          style={{ flexShrink: 0, padding: "8px 12px", borderRadius: 9, border: "none", fontSize: 11.5, fontWeight: 700, whiteSpace: "nowrap", background: tab === "commissions" ? COLORS.white : "transparent", color: tab === "commissions" ? COLORS.ink : COLORS.ink55, boxShadow: tab === "commissions" ? "0 1px 3px rgba(0,0,0,0.08)" : "none" }}
+        >
+          Rate Requests {commissionRequests.length > 0 && `(${commissionRequests.length})`}
+        </button>
+        <button
+          type="button"
+          onClick={() => setTab("renewals")}
+          style={{ flexShrink: 0, padding: "8px 12px", borderRadius: 9, border: "none", fontSize: 11.5, fontWeight: 700, whiteSpace: "nowrap", background: tab === "renewals" ? COLORS.white : "transparent", color: tab === "renewals" ? COLORS.ink : COLORS.ink55, boxShadow: tab === "renewals" ? "0 1px 3px rgba(0,0,0,0.08)" : "none" }}
+        >
+          Renewals {renewals.length > 0 && `(${renewals.length})`}
+        </button>
+        <button
+          type="button"
+          onClick={() => setTab("hubListings")}
+          style={{ flexShrink: 0, padding: "8px 12px", borderRadius: 9, border: "none", fontSize: 11.5, fontWeight: 700, whiteSpace: "nowrap", background: tab === "hubListings" ? COLORS.white : "transparent", color: tab === "hubListings" ? COLORS.ink : COLORS.ink55, boxShadow: tab === "hubListings" ? "0 1px 3px rgba(0,0,0,0.08)" : "none" }}
+        >
+          Hub Listings {hubListings.length > 0 && `(${hubListings.length})`}
+        </button>
+        <button
+          type="button"
+          onClick={() => setTab("hubPayments")}
+          style={{ flexShrink: 0, padding: "8px 12px", borderRadius: 9, border: "none", fontSize: 11.5, fontWeight: 700, whiteSpace: "nowrap", background: tab === "hubPayments" ? COLORS.white : "transparent", color: tab === "hubPayments" ? COLORS.ink : COLORS.ink55, boxShadow: tab === "hubPayments" ? "0 1px 3px rgba(0,0,0,0.08)" : "none" }}
+        >
+          Hub Payments {hubPayments.length > 0 && `(${hubPayments.length})`}
+        </button>
+      </div>
+
+      {tab === "registrations" && (
+        organizations.length === 0 ? (
+          <div style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: "32px 20px", textAlign: "center" }}>
+            <CheckCircle2 size={28} color={COLORS.green} style={{ marginBottom: 10 }} />
+            <p style={{ fontSize: 13.5, fontWeight: 600, margin: 0 }}>No pending registrations</p>
+            <p style={{ fontSize: 12, color: COLORS.ink55, marginTop: 4 }}>New Business Owner sign-ups will show up here for review.</p>
+          </div>
+        ) : (
+          <>
+            <p style={{ fontSize: 12, color: COLORS.ink55, marginBottom: 12 }}>
+              {organizations.length} registration{organizations.length !== 1 ? "s" : ""} waiting on subscription payment confirmation.
+            </p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {organizations.map((org) => (
+                <div key={org.id} style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: 16 }}>
+                  <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 10 }}>
+                    <div>
+                      <p style={{ fontSize: 14.5, fontWeight: 700, margin: 0 }}>{org.name}</p>
+                      <p style={{ fontSize: 11.5, color: COLORS.ink55, margin: "2px 0 0" }}>Submitted {new Date(org.createdAt).toLocaleDateString()}</p>
+                    </div>
+                    <span style={{ fontSize: 9.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.3, color: COLORS.gold, background: COLORS.goldSoft, padding: "3px 8px", borderRadius: 999 }}>Pending</span>
+                  </div>
+
+                  <div style={{ borderRadius: 12, background: COLORS.ink06, padding: 10, marginBottom: 12 }}>
+                    <p style={{ fontSize: 12.5, fontWeight: 600, margin: 0 }}>{org.ownerFullName}</p>
+                    <p style={{ fontSize: 11.5, color: COLORS.ink60, margin: "2px 0 0" }}>{org.ownerEmail}</p>
+                    <p style={{ fontSize: 11.5, color: COLORS.ink60, margin: "1px 0 0" }}>{org.ownerPhone}</p>
+                    {org.businessRegNumber && (
+                      <p style={{ fontSize: 11.5, color: COLORS.ink60, margin: "1px 0 0" }}>Reg. no: {org.businessRegNumber}</p>
+                    )}
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    <button
+                      onClick={() => setActionTarget({ org, kind: "reject" })}
+                      style={{ borderRadius: 10, border: `1px solid rgba(192,57,43,0.25)`, background: COLORS.redSoft, padding: "10px 0", fontSize: 12.5, fontWeight: 700, color: COLORS.red }}
+                    >
+                      Reject
+                    </button>
+                    <button
+                      onClick={() => setActionTarget({ org, kind: "approve" })}
+                      style={{ borderRadius: 10, border: "none", background: COLORS.green, padding: "10px 0", fontSize: 12.5, fontWeight: 700, color: COLORS.white }}
+                    >
+                      Approve
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )
+      )}
+
+      {tab === "commissions" && (
+        commissionRequests.length === 0 ? (
+          <div style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: "32px 20px", textAlign: "center" }}>
+            <CheckCircle2 size={28} color={COLORS.green} style={{ marginBottom: 10 }} />
+            <p style={{ fontSize: 13.5, fontWeight: 600, margin: 0 }}>No pending rate requests</p>
+            <p style={{ fontSize: 12, color: COLORS.ink55, marginTop: 4 }}>Custom commission rate requests from businesses will show up here.</p>
+          </div>
+        ) : (
+          <>
+            <p style={{ fontSize: 12, color: COLORS.ink55, marginBottom: 12 }}>
+              {commissionRequests.length} custom rate request{commissionRequests.length !== 1 ? "s" : ""} awaiting review.
+            </p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {commissionRequests.map((req) => (
+                <div key={req.id} style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: 16 }}>
+                  <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 10 }}>
+                    <div>
+                      <p style={{ fontSize: 14.5, fontWeight: 700, margin: 0 }}>{req.organizationName}</p>
+                      <p style={{ fontSize: 11.5, color: COLORS.ink55, margin: "2px 0 0" }}>Submitted {new Date(req.createdAt).toLocaleDateString()}</p>
+                    </div>
+                    <span style={{ fontSize: 9.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.3, color: COLORS.gold, background: COLORS.goldSoft, padding: "3px 8px", borderRadius: 999 }}>Pending</span>
+                  </div>
+
+                  <div style={{ borderRadius: 12, background: COLORS.ink06, padding: 10, marginBottom: 12 }}>
+                    <p style={{ fontSize: 12.5, fontWeight: 600, margin: 0 }}>{req.network} · {rateFieldLabel[req.transactionType] || req.transactionType}</p>
+                    <p style={{ fontSize: 11.5, color: COLORS.ink60, margin: "2px 0 0" }}>Requested rate: {req.ratePercent.toFixed(2)}%</p>
+                    {req.thresholdAmount !== null && req.capAmount !== null && (
+                      <p style={{ fontSize: 11.5, color: COLORS.ink60, margin: "1px 0 0" }}>
+                        Capped at GH₵{req.capAmount.toFixed(2)} above GH₵{req.thresholdAmount.toFixed(2)}
+                      </p>
+                    )}
+                    {req.providerSharePercent > 0 && (
+                      <p style={{ fontSize: 11.5, color: COLORS.ink60, margin: "1px 0 0" }}>Provider share: {req.providerSharePercent.toFixed(2)}%</p>
+                    )}
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    <button
+                      onClick={() => setCommissionActionTarget({ request: req, kind: "reject" })}
+                      style={{ borderRadius: 10, border: `1px solid rgba(192,57,43,0.25)`, background: COLORS.redSoft, padding: "10px 0", fontSize: 12.5, fontWeight: 700, color: COLORS.red }}
+                    >
+                      Reject
+                    </button>
+                    <button
+                      onClick={() => setCommissionActionTarget({ request: req, kind: "approve" })}
+                      style={{ borderRadius: 10, border: "none", background: COLORS.green, padding: "10px 0", fontSize: 12.5, fontWeight: 700, color: COLORS.white }}
+                    >
+                      Approve
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )
+      )}
+
+      {tab === "renewals" && (
+        renewals.length === 0 ? (
+          <div style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: "32px 20px", textAlign: "center" }}>
+            <CheckCircle2 size={28} color={COLORS.green} style={{ marginBottom: 10 }} />
+            <p style={{ fontSize: 13.5, fontWeight: 600, margin: 0 }}>No pending renewals</p>
+            <p style={{ fontSize: 12, color: COLORS.ink55, marginTop: 4 }}>Subscription renewal payments from businesses will show up here.</p>
+          </div>
+        ) : (
+          <>
+            <p style={{ fontSize: 12, color: COLORS.ink55, marginBottom: 12 }}>
+              {renewals.length} renewal payment{renewals.length !== 1 ? "s" : ""} awaiting verification.
+            </p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {renewals.map((payment) => (
+                <div key={payment.id} style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: 16 }}>
+                  <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 10 }}>
+                    <div>
+                      <p style={{ fontSize: 14.5, fontWeight: 700, margin: 0 }}>{payment.organizationName}</p>
+                      <p style={{ fontSize: 11.5, color: COLORS.ink55, margin: "2px 0 0" }}>Submitted {new Date(payment.createdAt).toLocaleDateString()}</p>
+                    </div>
+                    <span style={{ fontSize: 9.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.3, color: COLORS.gold, background: COLORS.goldSoft, padding: "3px 8px", borderRadius: 999 }}>Pending</span>
+                  </div>
+
+                  <div style={{ borderRadius: 12, background: COLORS.ink06, padding: 10, marginBottom: 12 }}>
+                    <p style={{ fontSize: 12.5, fontWeight: 600, margin: 0 }}>Ref: {payment.paymentReference}</p>
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    <button
+                      onClick={() => setRenewalActionTarget({ payment, kind: "reject" })}
+                      style={{ borderRadius: 10, border: `1px solid rgba(192,57,43,0.25)`, background: COLORS.redSoft, padding: "10px 0", fontSize: 12.5, fontWeight: 700, color: COLORS.red }}
+                    >
+                      Reject
+                    </button>
+                    <button
+                      onClick={() => setRenewalActionTarget({ payment, kind: "approve" })}
+                      style={{ borderRadius: 10, border: "none", background: COLORS.green, padding: "10px 0", fontSize: 12.5, fontWeight: 700, color: COLORS.white }}
+                    >
+                      Verify
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )
+      )}
+
+      {tab === "hubListings" && (
+        hubListings.length === 0 ? (
+          <div style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: "32px 20px", textAlign: "center" }}>
+            <CheckCircle2 size={28} color={COLORS.green} style={{ marginBottom: 10 }} />
+            <p style={{ fontSize: 13.5, fontWeight: 600, margin: 0 }}>No listings awaiting review</p>
+            <p style={{ fontSize: 12, color: COLORS.ink55, marginTop: 4 }}>New Business Hub listing submissions will show up here.</p>
+          </div>
+        ) : (
+          <>
+            <p style={{ fontSize: 12, color: COLORS.ink55, marginBottom: 12 }}>
+              {hubListings.length} listing{hubListings.length !== 1 ? "s" : ""} awaiting content review.
+            </p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {hubListings.map((listing) => (
+                <div key={listing.id} style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: 16 }}>
+                  <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 10 }}>
+                    <div>
+                      <p style={{ fontSize: 14.5, fontWeight: 700, margin: 0 }}>{listing.title}</p>
+                      <p style={{ fontSize: 11.5, color: COLORS.ink55, margin: "2px 0 0" }}>{listing.organizationName} · GH₵{listing.priceGhs.toFixed(2)}</p>
+                    </div>
+                    <span style={{ fontSize: 9.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.3, color: COLORS.gold, background: COLORS.goldSoft, padding: "3px 8px", borderRadius: 999 }}>Pending</span>
+                  </div>
+
+                  <div style={{ borderRadius: 12, background: COLORS.ink06, padding: 10, marginBottom: 12 }}>
+                    <p style={{ fontSize: 12, color: COLORS.ink70, margin: 0 }}>{listing.description}</p>
+                    <p style={{ fontSize: 11.5, color: COLORS.ink55, margin: "4px 0 0" }}>{listing.category} · {listing.location}</p>
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    <button
+                      onClick={() => setHubListingActionTarget({ listing, kind: "reject" })}
+                      style={{ borderRadius: 10, border: `1px solid rgba(192,57,43,0.25)`, background: COLORS.redSoft, padding: "10px 0", fontSize: 12.5, fontWeight: 700, color: COLORS.red }}
+                    >
+                      Reject
+                    </button>
+                    <button
+                      onClick={() => setHubListingActionTarget({ listing, kind: "approve" })}
+                      style={{ borderRadius: 10, border: "none", background: COLORS.green, padding: "10px 0", fontSize: 12.5, fontWeight: 700, color: COLORS.white }}
+                    >
+                      Approve
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )
+      )}
+
+      {tab === "hubPayments" && (
+        hubPayments.length === 0 ? (
+          <div style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: "32px 20px", textAlign: "center" }}>
+            <CheckCircle2 size={28} color={COLORS.green} style={{ marginBottom: 10 }} />
+            <p style={{ fontSize: 13.5, fontWeight: 600, margin: 0 }}>No listing payments pending</p>
+            <p style={{ fontSize: 12, color: COLORS.ink55, marginTop: 4 }}>Publishing fee payments from approved listings will show up here.</p>
+          </div>
+        ) : (
+          <>
+            <p style={{ fontSize: 12, color: COLORS.ink55, marginBottom: 12 }}>
+              {hubPayments.length} listing payment{hubPayments.length !== 1 ? "s" : ""} awaiting verification.
+            </p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {hubPayments.map((payment) => (
+                <div key={payment.id} style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: 16 }}>
+                  <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 10 }}>
+                    <div>
+                      <p style={{ fontSize: 14.5, fontWeight: 700, margin: 0 }}>{payment.listingTitle}</p>
+                      <p style={{ fontSize: 11.5, color: COLORS.ink55, margin: "2px 0 0" }}>{payment.organizationName}</p>
+                    </div>
+                    <span style={{ fontSize: 9.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.3, color: COLORS.gold, background: COLORS.goldSoft, padding: "3px 8px", borderRadius: 999 }}>Pending</span>
+                  </div>
+
+                  <div style={{ borderRadius: 12, background: COLORS.ink06, padding: 10, marginBottom: 12 }}>
+                    <p style={{ fontSize: 12.5, fontWeight: 600, margin: 0 }}>Ref: {payment.paymentReference}</p>
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    <button
+                      onClick={() => setHubPaymentActionTarget({ payment, kind: "reject" })}
+                      style={{ borderRadius: 10, border: `1px solid rgba(192,57,43,0.25)`, background: COLORS.redSoft, padding: "10px 0", fontSize: 12.5, fontWeight: 700, color: COLORS.red }}
+                    >
+                      Reject
+                    </button>
+                    <button
+                      onClick={() => setHubPaymentActionTarget({ payment, kind: "approve" })}
+                      style={{ borderRadius: 10, border: "none", background: COLORS.green, padding: "10px 0", fontSize: 12.5, fontWeight: 700, color: COLORS.white }}
+                    >
+                      Verify
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )
+      )}
+
+      {actionTarget && (
+        <ApprovalActionModal
+          org={actionTarget.org}
+          kind={actionTarget.kind}
+          submitting={submitting}
+          onClose={() => setActionTarget(null)}
+          onApprove={(paymentReference) => handleApprove(actionTarget.org, paymentReference)}
+          onReject={(reason) => handleReject(actionTarget.org, reason)}
+        />
+      )}
+
+      {renewalActionTarget && (
+        <RenewalActionModal
+          payment={renewalActionTarget.payment}
+          kind={renewalActionTarget.kind}
+          submitting={submitting}
+          onClose={() => setRenewalActionTarget(null)}
+          onApprove={() => handleVerifyRenewal(renewalActionTarget.payment)}
+          onReject={(reason) => handleRejectRenewal(renewalActionTarget.payment, reason)}
+        />
+      )}
+
+      {hubListingActionTarget && (
+        <HubListingActionModal
+          listing={hubListingActionTarget.listing}
+          kind={hubListingActionTarget.kind}
+          submitting={submitting}
+          onClose={() => setHubListingActionTarget(null)}
+          onApprove={() => handleApproveHubListing(hubListingActionTarget.listing)}
+          onReject={(reason) => handleRejectHubListing(hubListingActionTarget.listing, reason)}
+        />
+      )}
+
+      {hubPaymentActionTarget && (
+        <HubPaymentActionModal
+          payment={hubPaymentActionTarget.payment}
+          kind={hubPaymentActionTarget.kind}
+          submitting={submitting}
+          onClose={() => setHubPaymentActionTarget(null)}
+          onApprove={() => handleVerifyHubPayment(hubPaymentActionTarget.payment)}
+          onReject={(reason) => handleRejectHubPayment(hubPaymentActionTarget.payment, reason)}
+        />
+      )}
+
+      {commissionActionTarget && (
+        <CommissionRequestActionModal
+          request={commissionActionTarget.request}
+          kind={commissionActionTarget.kind}
+          submitting={submitting}
+          onClose={() => setCommissionActionTarget(null)}
+          onApprove={() => handleApproveCommissionRequest(commissionActionTarget.request)}
+          onReject={(reason) => handleRejectCommissionRequest(commissionActionTarget.request, reason)}
+        />
+      )}
+    </div>
+  );
+}
+
+function ApprovalActionModal({ org, kind, submitting, onClose, onApprove, onReject }) {
+  const [paymentReference, setPaymentReference] = useState("");
+  const [reason, setReason] = useState("");
+  const isApprove = kind === "approve";
+
+  const inputStyle = { width: "100%", borderRadius: 12, border: `1px solid ${COLORS.ink12}`, background: COLORS.white, padding: "12px 14px", fontSize: 14, boxSizing: "border-box", outline: "none", marginBottom: 4 };
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    if (isApprove) {
+      if (paymentReference.trim().length === 0) return;
+      onApprove(paymentReference.trim());
+    } else {
+      if (reason.trim().length === 0) return;
+      onReject(reason.trim());
+    }
+  }
+
+  const disabled = submitting || (isApprove ? paymentReference.trim().length === 0 : reason.trim().length === 0);
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 40, display: "flex", alignItems: "flex-end", justifyContent: "center", background: "rgba(0,0,0,0.4)" }}>
+      <form onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit} style={{ width: "100%", maxWidth: 448, borderRadius: "24px 24px 0 0", background: COLORS.cream, padding: "20px 20px 28px", boxSizing: "border-box" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+          <h3 style={{ fontSize: 17, fontWeight: 700, margin: 0 }}>{isApprove ? "Approve" : "Reject"} {org.name}</h3>
+          <button type="button" onClick={onClose} aria-label="Close" style={{ borderRadius: 999, background: COLORS.ink08, padding: 6, border: "none" }}>
+            <X size={16} />
+          </button>
+        </div>
+
+        {isApprove ? (
+          <>
+            <p style={{ fontSize: 12.5, color: COLORS.ink60, marginBottom: 14 }}>
+              Confirm you've verified the MTN MoMo subscription payment, then enter the reference to activate this account.
+            </p>
+            <label style={{ display: "block", fontSize: 11.5, fontWeight: 600, textTransform: "uppercase", color: COLORS.ink55, marginBottom: 6 }}>Payment Reference</label>
+            <input type="text" value={paymentReference} onChange={(e) => setPaymentReference(e.target.value)} placeholder="e.g. MOMO-REF-998877" style={inputStyle} />
+          </>
+        ) : (
+          <>
+            <p style={{ fontSize: 12.5, color: COLORS.ink60, marginBottom: 14 }}>
+              This registration will be marked rejected. The applicant can be told why via the reason below.
+            </p>
+            <label style={{ display: "block", fontSize: 11.5, fontWeight: 600, textTransform: "uppercase", color: COLORS.ink55, marginBottom: 6 }}>Reason</label>
+            <input type="text" value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Payment reference could not be verified" style={inputStyle} />
+          </>
+        )}
+
+        <button
+          type="submit"
+          disabled={disabled}
+          style={{ width: "100%", marginTop: 16, borderRadius: 12, background: isApprove ? COLORS.green : COLORS.red, color: COLORS.white, fontWeight: 700, padding: "14px 0", fontSize: 14.5, border: "none", opacity: disabled ? 0.5 : 1 }}
+        >
+          {submitting ? "Submitting..." : isApprove ? "Confirm Approval" : "Confirm Rejection"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function CommissionRequestActionModal({ request, kind, submitting, onClose, onApprove, onReject }) {
+  const [reason, setReason] = useState("");
+  const isApprove = kind === "approve";
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    if (isApprove) {
+      onApprove();
+    } else {
+      if (reason.trim().length === 0) return;
+      onReject(reason.trim());
+    }
+  }
+
+  const disabled = submitting || (!isApprove && reason.trim().length === 0);
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 40, display: "flex", alignItems: "flex-end", justifyContent: "center", background: "rgba(0,0,0,0.4)" }}>
+      <form onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit} style={{ width: "100%", maxWidth: 448, borderRadius: "24px 24px 0 0", background: COLORS.cream, padding: "20px 20px 28px", boxSizing: "border-box" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+          <h3 style={{ fontSize: 17, fontWeight: 700, margin: 0 }}>{isApprove ? "Approve" : "Reject"} rate change</h3>
+          <button type="button" onClick={onClose} aria-label="Close" style={{ borderRadius: 999, background: COLORS.ink08, padding: 6, border: "none" }}>
+            <X size={16} />
+          </button>
+        </div>
+
+        {isApprove ? (
+          <p style={{ fontSize: 12.5, color: COLORS.ink60, marginBottom: 14 }}>
+            {request.organizationName} requested {request.ratePercent.toFixed(2)}% for {request.network} {request.transactionType.replace("_", " ")}. Approving applies this to every branch of that business immediately.
+          </p>
+        ) : (
+          <>
+            <p style={{ fontSize: 12.5, color: COLORS.ink60, marginBottom: 14 }}>
+              This rate request will be marked rejected. Let {request.organizationName} know why below.
+            </p>
+            <label style={{ display: "block", fontSize: 11.5, fontWeight: 600, textTransform: "uppercase", color: COLORS.ink55, marginBottom: 6 }}>Reason</label>
+            <input
+              type="text"
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder="e.g. Rate too far below platform default"
+              style={{ width: "100%", borderRadius: 12, border: `1px solid ${COLORS.ink12}`, background: COLORS.white, padding: "12px 14px", fontSize: 14, boxSizing: "border-box", outline: "none", marginBottom: 4 }}
+            />
+          </>
+        )}
+
+        <button
+          type="submit"
+          disabled={disabled}
+          style={{ width: "100%", marginTop: 16, borderRadius: 12, background: isApprove ? COLORS.green : COLORS.red, color: COLORS.white, fontWeight: 700, padding: "14px 0", fontSize: 14.5, border: "none", opacity: disabled ? 0.5 : 1 }}
+        >
+          {submitting ? "Submitting..." : isApprove ? "Confirm Approval" : "Confirm Rejection"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function RenewalActionModal({ payment, kind, submitting, onClose, onApprove, onReject }) {
+  const [reason, setReason] = useState("");
+  const isApprove = kind === "approve";
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    if (isApprove) {
+      onApprove();
+    } else {
+      if (reason.trim().length === 0) return;
+      onReject(reason.trim());
+    }
+  }
+
+  const disabled = submitting || (!isApprove && reason.trim().length === 0);
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 40, display: "flex", alignItems: "flex-end", justifyContent: "center", background: "rgba(0,0,0,0.4)" }}>
+      <form onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit} style={{ width: "100%", maxWidth: 448, borderRadius: "24px 24px 0 0", background: COLORS.cream, padding: "20px 20px 28px", boxSizing: "border-box" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+          <h3 style={{ fontSize: 17, fontWeight: 700, margin: 0 }}>{isApprove ? "Verify" : "Reject"} renewal</h3>
+          <button type="button" onClick={onClose} aria-label="Close" style={{ borderRadius: 999, background: COLORS.ink08, padding: 6, border: "none" }}>
+            <X size={16} />
+          </button>
+        </div>
+
+        {isApprove ? (
+          <p style={{ fontSize: 12.5, color: COLORS.ink60, marginBottom: 14 }}>
+            Confirm you've verified reference <strong>{payment.paymentReference}</strong> from {payment.organizationName} via MTN MoMo. This extends their subscription by 30 days and restores access if suspended.
+          </p>
+        ) : (
+          <>
+            <p style={{ fontSize: 12.5, color: COLORS.ink60, marginBottom: 14 }}>
+              This renewal payment will be marked rejected. Let {payment.organizationName} know why below.
+            </p>
+            <label style={{ display: "block", fontSize: 11.5, fontWeight: 600, textTransform: "uppercase", color: COLORS.ink55, marginBottom: 6 }}>Reason</label>
+            <input
+              type="text"
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder="e.g. Reference could not be verified"
+              style={{ width: "100%", borderRadius: 12, border: `1px solid ${COLORS.ink12}`, background: COLORS.white, padding: "12px 14px", fontSize: 14, boxSizing: "border-box", outline: "none", marginBottom: 4 }}
+            />
+          </>
+        )}
+
+        <button
+          type="submit"
+          disabled={disabled}
+          style={{ width: "100%", marginTop: 16, borderRadius: 12, background: isApprove ? COLORS.green : COLORS.red, color: COLORS.white, fontWeight: 700, padding: "14px 0", fontSize: 14.5, border: "none", opacity: disabled ? 0.5 : 1 }}
+        >
+          {submitting ? "Submitting..." : isApprove ? "Confirm Verification" : "Confirm Rejection"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function HubListingActionModal({ listing, kind, submitting, onClose, onApprove, onReject }) {
+  const [reason, setReason] = useState("");
+  const isApprove = kind === "approve";
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    if (isApprove) {
+      onApprove();
+    } else {
+      if (reason.trim().length === 0) return;
+      onReject(reason.trim());
+    }
+  }
+
+  const disabled = submitting || (!isApprove && reason.trim().length === 0);
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 40, display: "flex", alignItems: "flex-end", justifyContent: "center", background: "rgba(0,0,0,0.4)" }}>
+      <form onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit} style={{ width: "100%", maxWidth: 448, borderRadius: "24px 24px 0 0", background: COLORS.cream, padding: "20px 20px 28px", boxSizing: "border-box" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+          <h3 style={{ fontSize: 17, fontWeight: 700, margin: 0 }}>{isApprove ? "Approve" : "Reject"} listing</h3>
+          <button type="button" onClick={onClose} aria-label="Close" style={{ borderRadius: 999, background: COLORS.ink08, padding: 6, border: "none" }}>
+            <X size={16} />
+          </button>
+        </div>
+
+        {isApprove ? (
+          <p style={{ fontSize: 12.5, color: COLORS.ink60, marginBottom: 14 }}>
+            "{listing.title}" will move to Pending Payment — a publishing fee is calculated automatically from the current advertisement fee rate and the listing's price (GH₵{listing.priceGhs.toFixed(2)}).
+          </p>
+        ) : (
+          <>
+            <p style={{ fontSize: 12.5, color: COLORS.ink60, marginBottom: 14 }}>
+              This listing will be marked rejected. Let the business know why below.
+            </p>
+            <label style={{ display: "block", fontSize: 11.5, fontWeight: 600, textTransform: "uppercase", color: COLORS.ink55, marginBottom: 6 }}>Reason</label>
+            <input
+              type="text"
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder="e.g. Prohibited item category"
+              style={{ width: "100%", borderRadius: 12, border: `1px solid ${COLORS.ink12}`, background: COLORS.white, padding: "12px 14px", fontSize: 14, boxSizing: "border-box", outline: "none", marginBottom: 4 }}
+            />
+          </>
+        )}
+
+        <button
+          type="submit"
+          disabled={disabled}
+          style={{ width: "100%", marginTop: 16, borderRadius: 12, background: isApprove ? COLORS.green : COLORS.red, color: COLORS.white, fontWeight: 700, padding: "14px 0", fontSize: 14.5, border: "none", opacity: disabled ? 0.5 : 1 }}
+        >
+          {submitting ? "Submitting..." : isApprove ? "Confirm Approval" : "Confirm Rejection"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function HubPaymentActionModal({ payment, kind, submitting, onClose, onApprove, onReject }) {
+  const [reason, setReason] = useState("");
+  const isApprove = kind === "approve";
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    if (isApprove) {
+      onApprove();
+    } else {
+      if (reason.trim().length === 0) return;
+      onReject(reason.trim());
+    }
+  }
+
+  const disabled = submitting || (!isApprove && reason.trim().length === 0);
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 40, display: "flex", alignItems: "flex-end", justifyContent: "center", background: "rgba(0,0,0,0.4)" }}>
+      <form onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit} style={{ width: "100%", maxWidth: 448, borderRadius: "24px 24px 0 0", background: COLORS.cream, padding: "20px 20px 28px", boxSizing: "border-box" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+          <h3 style={{ fontSize: 17, fontWeight: 700, margin: 0 }}>{isApprove ? "Verify" : "Reject"} payment</h3>
+          <button type="button" onClick={onClose} aria-label="Close" style={{ borderRadius: 999, background: COLORS.ink08, padding: 6, border: "none" }}>
+            <X size={16} />
+          </button>
+        </div>
+
+        {isApprove ? (
+          <p style={{ fontSize: 12.5, color: COLORS.ink60, marginBottom: 14 }}>
+            Confirm you've verified reference <strong>{payment.paymentReference}</strong> for "{payment.listingTitle}" via MTN MoMo. This publishes the listing for 30 days.
+          </p>
+        ) : (
+          <>
+            <p style={{ fontSize: 12.5, color: COLORS.ink60, marginBottom: 14 }}>
+              This payment will be marked rejected. The listing stays unpublished until a new reference is submitted.
+            </p>
+            <label style={{ display: "block", fontSize: 11.5, fontWeight: 600, textTransform: "uppercase", color: COLORS.ink55, marginBottom: 6 }}>Reason</label>
+            <input
+              type="text"
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder="e.g. Reference could not be verified"
+              style={{ width: "100%", borderRadius: 12, border: `1px solid ${COLORS.ink12}`, background: COLORS.white, padding: "12px 14px", fontSize: 14, boxSizing: "border-box", outline: "none", marginBottom: 4 }}
+            />
+          </>
+        )}
+
+        <button
+          type="submit"
+          disabled={disabled}
+          style={{ width: "100%", marginTop: 16, borderRadius: 12, background: isApprove ? COLORS.green : COLORS.red, color: COLORS.white, fontWeight: 700, padding: "14px 0", fontSize: 14.5, border: "none", opacity: disabled ? 0.5 : 1 }}
+        >
+          {submitting ? "Submitting..." : isApprove ? "Confirm Verification" : "Confirm Rejection"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+/* ---------------- Subscription Screen ---------------- */
+
+function SubscriptionScreen({ status, api, onReload, showToast }) {
+  const [paymentReference, setPaymentReference] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [history, setHistory] = useState([]);
+
+  useEffect(() => {
+    api
+      .listMyRenewalPayments()
+      .then(setHistory)
+      .catch(() => {});
+  }, [api]);
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    if (paymentReference.trim().length === 0) return;
+    setSubmitting(true);
+    try {
+      await api.submitRenewalPayment(paymentReference.trim());
+      showToast("Renewal payment submitted for verification");
+      setPaymentReference("");
+      onReload();
+      const refreshed = await api.listMyRenewalPayments();
+      setHistory(refreshed);
+    } catch (err) {
+      if (err.isNetworkError) showToast("Can't reach the server — try again once you're back online");
+      else showToast(err.message || "Failed to submit renewal payment");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  if (!status) {
+    return (
+      <div style={{ padding: "40px 20px", textAlign: "center" }}>
+        <p style={{ fontSize: 13, color: COLORS.ink55 }}>Loading subscription status...</p>
+      </div>
+    );
+  }
+
+  const statusLabel = { active: "Active", grace_period: "Grace Period", suspended: "Suspended" }[status.status] || status.status;
+  const statusColor = status.status === "active" ? COLORS.green : status.status === "grace_period" ? COLORS.gold : COLORS.red;
+  const statusBg = status.status === "active" ? COLORS.greenSoft : status.status === "grace_period" ? COLORS.goldSoft : COLORS.redSoft;
+
+  return (
+    <div style={{ padding: "16px 16px 16px" }}>
+      <div style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: 18, marginBottom: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+          <p style={{ fontSize: 13, fontWeight: 600, color: COLORS.ink60, margin: 0 }}>Business Plan</p>
+          <span style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.3, color: statusColor, background: statusBg, padding: "4px 10px", borderRadius: 999 }}>{statusLabel}</span>
+        </div>
+
+        {status.status !== "suspended" && status.daysRemaining !== null && (
+          <p style={{ fontSize: 22, fontWeight: 700, margin: 0 }}>
+            {status.daysRemaining >= 0 ? status.daysRemaining : 0} <span style={{ fontSize: 13, fontWeight: 600, color: COLORS.ink55 }}>day{status.daysRemaining !== 1 ? "s" : ""} remaining</span>
+          </p>
+        )}
+        {status.subscriptionExpiresAt && (
+          <p style={{ fontSize: 11.5, color: COLORS.ink55, marginTop: 4 }}>
+            {status.status === "suspended" ? "Expired" : "Renews"} on {new Date(status.subscriptionExpiresAt).toLocaleDateString()}
+          </p>
+        )}
+
+        {status.status === "grace_period" && (
+          <p style={{ fontSize: 12, color: "#7A5A12", background: COLORS.goldSoft, borderRadius: 10, padding: "8px 10px", marginTop: 10 }}>
+            Your subscription has expired. Renew now — your account will be suspended if the grace period ({status.gracePeriodDays} days) runs out.
+          </p>
+        )}
+        {status.status === "suspended" && (
+          <p style={{ fontSize: 12, color: COLORS.red, background: COLORS.redSoft, borderRadius: 10, padding: "8px 10px", marginTop: 10 }}>
+            Your account is suspended. Submit a renewal payment below to restore access — your data has been preserved.
+          </p>
+        )}
+      </div>
+
+      <div style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: 18, marginBottom: 16 }}>
+        <p style={{ fontSize: 13.5, fontWeight: 700, marginBottom: 4 }}>Renew subscription</p>
+        <p style={{ fontSize: 12, color: COLORS.ink55, marginBottom: 14 }}>
+          Pay GH₵{status.subscriptionPriceGhs.toFixed(2)} via MTN MoMo to the AgentPro Ghana merchant number, then submit the payment reference below. A Superuser will verify it and extend your subscription by 30 days.
+        </p>
+        <form onSubmit={handleSubmit}>
+          <input
+            type="text"
+            value={paymentReference}
+            onChange={(e) => setPaymentReference(e.target.value)}
+            placeholder="e.g. MOMO-REF-123456"
+            style={{ width: "100%", borderRadius: 12, border: `1px solid ${COLORS.ink12}`, background: COLORS.cream, padding: "12px 14px", fontSize: 14, boxSizing: "border-box", outline: "none", marginBottom: 12 }}
+          />
+          <button
+            type="submit"
+            disabled={submitting || paymentReference.trim().length === 0}
+            style={{ width: "100%", borderRadius: 12, background: COLORS.green, color: COLORS.white, fontWeight: 700, padding: "13px 0", fontSize: 13.5, border: "none", opacity: submitting || paymentReference.trim().length === 0 ? 0.5 : 1 }}
+          >
+            {submitting ? "Submitting..." : "Submit payment reference"}
+          </button>
+        </form>
+      </div>
+
+      {history.length > 0 && (
+        <div>
+          <p style={{ fontSize: 12, fontWeight: 700, color: COLORS.ink60, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.3 }}>Payment History</p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {history.map((p) => (
+              <div key={p.id} style={{ borderRadius: 12, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: 12, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div>
+                  <p style={{ fontSize: 12.5, fontWeight: 600, margin: 0 }}>{p.paymentReference}</p>
+                  <p style={{ fontSize: 10.5, color: COLORS.ink55, margin: "2px 0 0" }}>{new Date(p.createdAt).toLocaleDateString()}</p>
+                  {p.status === "rejected" && p.rejectionReason && (
+                    <p style={{ fontSize: 10.5, color: COLORS.red, margin: "2px 0 0" }}>{p.rejectionReason}</p>
+                  )}
+                </div>
+                <span style={{
+                  fontSize: 9.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.3, padding: "3px 8px", borderRadius: 999,
+                  color: p.status === "verified" ? COLORS.green : p.status === "rejected" ? COLORS.red : COLORS.gold,
+                  background: p.status === "verified" ? COLORS.greenSoft : p.status === "rejected" ? COLORS.redSoft : COLORS.goldSoft,
+                }}>
+                  {p.status}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- Business Hub Screen ---------------- */
+
+function BusinessHubScreen({ api, showToast, canCreate }) {
+  const [tab, setTab] = useState("browse"); // "browse" | "mine"
+  const [browseListings, setBrowseListings] = useState([]);
+  const [myListings, setMyListings] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [paymentTarget, setPaymentTarget] = useState(null); // listing needing a payment reference
+
+  async function loadBrowse() {
+    try {
+      const data = await api.browseBusinessHubListings();
+      setBrowseListings(data);
+    } catch (err) {
+      if (!err.isNetworkError) showToast(err.message || "Failed to load listings");
+    }
+  }
+
+  async function loadMine() {
+    if (!canCreate) return;
+    try {
+      const data = await api.listMyBusinessHubListings();
+      setMyListings(data);
+    } catch (err) {
+      if (!err.isNetworkError) showToast(err.message || "Failed to load your listings");
+    }
+  }
+
+  useEffect(() => {
+    setLoading(true);
+    Promise.all([loadBrowse(), loadMine()]).finally(() => setLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function handleCreated() {
+    setShowCreateModal(false);
+    showToast("Listing submitted for review");
+    loadMine();
+  }
+
+  async function handleSubmitPayment(listing, paymentReference) {
+    try {
+      await api.submitBusinessHubListingPayment(listing.id, paymentReference);
+      showToast("Payment submitted for verification");
+      setPaymentTarget(null);
+      loadMine();
+    } catch (err) {
+      if (err.isNetworkError) showToast("Can't reach the server — try again once you're back online");
+      else showToast(err.message || "Failed to submit payment");
+    }
+  }
+
+  const statusLabel = {
+    pending_review: "Pending Review", rejected: "Rejected", pending_payment: "Pending Payment",
+    active: "Published", expired: "Expired", closed: "Closed",
+  };
+  const statusColor = (s) =>
+    s === "active" ? COLORS.green : s === "rejected" || s === "closed" ? COLORS.red : COLORS.gold;
+  const statusBg = (s) =>
+    s === "active" ? COLORS.greenSoft : s === "rejected" || s === "closed" ? COLORS.redSoft : COLORS.goldSoft;
+
+  return (
+    <div style={{ padding: "16px 16px 16px" }}>
+      <div style={{ display: "flex", borderRadius: 12, background: COLORS.ink06, padding: 4, marginBottom: 16 }}>
+        <button
+          type="button"
+          onClick={() => setTab("browse")}
+          style={{ flex: 1, padding: "8px 0", borderRadius: 9, border: "none", fontSize: 12.5, fontWeight: 700, background: tab === "browse" ? COLORS.white : "transparent", color: tab === "browse" ? COLORS.ink : COLORS.ink55, boxShadow: tab === "browse" ? "0 1px 3px rgba(0,0,0,0.08)" : "none" }}
+        >
+          Browse
+        </button>
+        {canCreate && (
+          <button
+            type="button"
+            onClick={() => setTab("mine")}
+            style={{ flex: 1, padding: "8px 0", borderRadius: 9, border: "none", fontSize: 12.5, fontWeight: 700, background: tab === "mine" ? COLORS.white : "transparent", color: tab === "mine" ? COLORS.ink : COLORS.ink55, boxShadow: tab === "mine" ? "0 1px 3px rgba(0,0,0,0.08)" : "none" }}
+          >
+            My Listings {myListings.length > 0 && `(${myListings.length})`}
+          </button>
+        )}
+      </div>
+
+      {loading ? (
+        <p style={{ fontSize: 13, color: COLORS.ink55, textAlign: "center", padding: "40px 0" }}>Loading...</p>
+      ) : tab === "browse" ? (
+        browseListings.length === 0 ? (
+          <div style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: "32px 20px", textAlign: "center" }}>
+            <Store size={28} color={COLORS.ink40} style={{ marginBottom: 10 }} />
+            <p style={{ fontSize: 13.5, fontWeight: 600, margin: 0 }}>No listings yet</p>
+            <p style={{ fontSize: 12, color: COLORS.ink55, marginTop: 4 }}>Published listings from businesses across the platform will show up here.</p>
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {browseListings.map((listing) => (
+              <div key={listing.id} style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: 16 }}>
+                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 6 }}>
+                  <p style={{ fontSize: 14.5, fontWeight: 700, margin: 0 }}>{listing.title}</p>
+                  <p style={{ fontSize: 14, fontWeight: 700, color: COLORS.green, margin: 0, whiteSpace: "nowrap" }}>GH₵{listing.priceGhs.toFixed(2)}</p>
+                </div>
+                <p style={{ fontSize: 12, color: COLORS.ink70, margin: "0 0 8px" }}>{listing.description}</p>
+                <p style={{ fontSize: 11, color: COLORS.ink55, margin: 0 }}>{listing.category} · {listing.location}</p>
+              </div>
+            ))}
+          </div>
+        )
+      ) : myListings.length === 0 ? (
+        <div style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: "32px 20px", textAlign: "center" }}>
+          <Store size={28} color={COLORS.ink40} style={{ marginBottom: 10 }} />
+          <p style={{ fontSize: 13.5, fontWeight: 600, margin: 0 }}>You haven't posted any listings</p>
+          <p style={{ fontSize: 12, color: COLORS.ink55, marginTop: 4 }}>Post your first listing to reach other businesses on the platform.</p>
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {myListings.map((listing) => (
+            <div key={listing.id} style={{ borderRadius: 16, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: 16 }}>
+              <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 6 }}>
+                <p style={{ fontSize: 14.5, fontWeight: 700, margin: 0 }}>{listing.title}</p>
+                <span style={{ fontSize: 9.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.3, color: statusColor(listing.status), background: statusBg(listing.status), padding: "3px 8px", borderRadius: 999, whiteSpace: "nowrap" }}>
+                  {statusLabel[listing.status] || listing.status}
+                </span>
+              </div>
+              <p style={{ fontSize: 12, color: COLORS.ink70, margin: "0 0 6px" }}>GH₵{listing.priceGhs.toFixed(2)} · {listing.category} · {listing.location}</p>
+
+              {listing.status === "rejected" && listing.rejectionReason && (
+                <p style={{ fontSize: 11.5, color: COLORS.red, background: COLORS.redSoft, borderRadius: 8, padding: "6px 8px", margin: "6px 0 0" }}>{listing.rejectionReason}</p>
+              )}
+              {listing.status === "pending_payment" && (
+                <>
+                  <p style={{ fontSize: 11.5, color: "#7A5A12", background: COLORS.goldSoft, borderRadius: 8, padding: "6px 8px", margin: "6px 0 10px" }}>
+                    Approved — publishing fee GH₵{listing.feeGhs?.toFixed(2)}. Pay via MTN MoMo, then submit your reference.
+                  </p>
+                  <button
+                    onClick={() => setPaymentTarget(listing)}
+                    style={{ width: "100%", borderRadius: 10, background: COLORS.green, color: COLORS.white, fontWeight: 700, padding: "10px 0", fontSize: 12.5, border: "none" }}
+                  >
+                    Submit payment reference
+                  </button>
+                </>
+              )}
+              {listing.status === "active" && listing.expiresAt && (
+                <p style={{ fontSize: 11, color: COLORS.ink55, margin: "6px 0 0" }}>Live until {new Date(listing.expiresAt).toLocaleDateString()}</p>
+              )}
+              {listing.status === "expired" && (
+                <>
+                  <p style={{ fontSize: 11.5, color: COLORS.red, background: COLORS.redSoft, borderRadius: 8, padding: "6px 8px", margin: "6px 0 10px" }}>
+                    Expired. Renew now before the grace period ends.
+                  </p>
+                  <button
+                    onClick={() => setPaymentTarget(listing)}
+                    style={{ width: "100%", borderRadius: 10, background: COLORS.green, color: COLORS.white, fontWeight: 700, padding: "10px 0", fontSize: 12.5, border: "none" }}
+                  >
+                    Submit renewal payment
+                  </button>
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {canCreate && tab === "mine" && (
+        <button
+          onClick={() => setShowCreateModal(true)}
+          style={{ position: "fixed", bottom: 84, right: 20, maxWidth: 448, borderRadius: 999, background: COLORS.gold, color: COLORS.ink, fontWeight: 700, padding: "13px 20px", fontSize: 13, border: "none", boxShadow: "0 4px 12px rgba(0,0,0,0.18)", display: "flex", alignItems: "center", gap: 6 }}
+        >
+          <Plus size={16} /> New Listing
+        </button>
+      )}
+
+      {showCreateModal && (
+        <CreateListingModal api={api} onClose={() => setShowCreateModal(false)} onCreated={handleCreated} showToast={showToast} />
+      )}
+
+      {paymentTarget && (
+        <SubmitListingPaymentModal
+          listing={paymentTarget}
+          onClose={() => setPaymentTarget(null)}
+          onSubmit={(ref) => handleSubmitPayment(paymentTarget, ref)}
+        />
+      )}
+    </div>
+  );
+}
+
+function CreateListingModal({ api, onClose, onCreated, showToast }) {
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [priceGhs, setPriceGhs] = useState("");
+  const [category, setCategory] = useState("");
+  const [location, setLocation] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const inputStyle = { width: "100%", borderRadius: 12, border: `1px solid ${COLORS.ink12}`, background: COLORS.white, padding: "12px 14px", fontSize: 14, boxSizing: "border-box", outline: "none", marginBottom: 10 };
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    if (!title.trim() || !description.trim() || !category.trim() || !location.trim() || !priceGhs) return;
+    setSubmitting(true);
+    try {
+      await api.createBusinessHubListing({
+        title: title.trim(), description: description.trim(), priceGhs: parseFloat(priceGhs),
+        category: category.trim(), location: location.trim(),
+      });
+      onCreated();
+    } catch (err) {
+      if (err.isNetworkError) showToast("Can't reach the server — try again once you're back online");
+      else showToast(err.message || "Failed to submit listing");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const disabled = submitting || !title.trim() || !description.trim() || !category.trim() || !location.trim() || !priceGhs;
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 40, display: "flex", alignItems: "flex-end", justifyContent: "center", background: "rgba(0,0,0,0.4)" }}>
+      <form onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit} style={{ width: "100%", maxWidth: 448, maxHeight: "85vh", overflowY: "auto", borderRadius: "24px 24px 0 0", background: COLORS.cream, padding: "20px 20px 28px", boxSizing: "border-box" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+          <h3 style={{ fontSize: 17, fontWeight: 700, margin: 0 }}>New Listing</h3>
+          <button type="button" onClick={onClose} aria-label="Close" style={{ borderRadius: 999, background: COLORS.ink08, padding: 6, border: "none" }}>
+            <X size={16} />
+          </button>
+        </div>
+
+        <input type="text" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Title" style={inputStyle} />
+        <textarea value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description" rows={3} style={{ ...inputStyle, resize: "vertical", fontFamily: "inherit" }} />
+        <input type="number" step="0.01" min="0" value={priceGhs} onChange={(e) => setPriceGhs(e.target.value)} placeholder="Price (GH₵)" style={inputStyle} />
+        <input type="text" value={category} onChange={(e) => setCategory(e.target.value)} placeholder="Category (e.g. Electronics)" style={inputStyle} />
+        <input type="text" value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Location (e.g. Accra)" style={inputStyle} />
+
+        <p style={{ fontSize: 11, color: COLORS.ink55, marginBottom: 12 }}>
+          Your listing goes to a Superuser for review. Once approved, you'll be shown a publishing fee to pay via MTN MoMo.
+        </p>
+
+        <button
+          type="submit"
+          disabled={disabled}
+          style={{ width: "100%", borderRadius: 12, background: COLORS.green, color: COLORS.white, fontWeight: 700, padding: "14px 0", fontSize: 14.5, border: "none", opacity: disabled ? 0.5 : 1 }}
+        >
+          {submitting ? "Submitting..." : "Submit for review"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function SubmitListingPaymentModal({ listing, onClose, onSubmit }) {
+  const [paymentReference, setPaymentReference] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    if (paymentReference.trim().length === 0) return;
+    setSubmitting(true);
+    await onSubmit(paymentReference.trim());
+    setSubmitting(false);
+  }
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 40, display: "flex", alignItems: "flex-end", justifyContent: "center", background: "rgba(0,0,0,0.4)" }}>
+      <form onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit} style={{ width: "100%", maxWidth: 448, borderRadius: "24px 24px 0 0", background: COLORS.cream, padding: "20px 20px 28px", boxSizing: "border-box" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+          <h3 style={{ fontSize: 17, fontWeight: 700, margin: 0 }}>Submit payment</h3>
+          <button type="button" onClick={onClose} aria-label="Close" style={{ borderRadius: 999, background: COLORS.ink08, padding: 6, border: "none" }}>
+            <X size={16} />
+          </button>
+        </div>
+        <p style={{ fontSize: 12.5, color: COLORS.ink60, marginBottom: 14 }}>
+          Pay GH₵{listing.feeGhs?.toFixed(2)} via MTN MoMo to the AgentPro Ghana merchant number, then enter the reference below.
+        </p>
+        <input
+          type="text"
+          value={paymentReference}
+          onChange={(e) => setPaymentReference(e.target.value)}
+          placeholder="e.g. MOMO-AD-123456"
+          style={{ width: "100%", borderRadius: 12, border: `1px solid ${COLORS.ink12}`, background: COLORS.white, padding: "12px 14px", fontSize: 14, boxSizing: "border-box", outline: "none", marginBottom: 12 }}
+        />
+        <button
+          type="submit"
+          disabled={submitting || paymentReference.trim().length === 0}
+          style={{ width: "100%", borderRadius: 12, background: COLORS.green, color: COLORS.white, fontWeight: 700, padding: "14px 0", fontSize: 14.5, border: "none", opacity: submitting || paymentReference.trim().length === 0 ? 0.5 : 1 }}
+        >
+          {submitting ? "Submitting..." : "Submit"}
+        </button>
+      </form>
     </div>
   );
 }
@@ -1884,6 +3833,74 @@ function TransactionModal({ type, rates, onClose, onSubmit }) {
           Confirm {config.title}
         </button>
       </form>
+    </div>
+  );
+}
+
+/* ---------------- USSD Live Transaction Progress ---------------- */
+
+function UssdProgressModal({ session, onCancel }) {
+  const isTerminal = session.status === "success" || session.status === "failed";
+  const isAwaitingPin = session.status === "awaiting_pin";
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.55)", padding: 20 }}>
+      <div style={{ width: "100%", maxWidth: 380, borderRadius: 20, background: COLORS.cream, padding: 20, boxSizing: "border-box" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+          <span style={{ height: 34, width: 34, borderRadius: 999, background: isTerminal ? (session.status === "success" ? COLORS.greenSoft : COLORS.redSoft) : COLORS.goldSoft, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+            {session.status === "success" ? (
+              <CheckCircle2 size={18} color={COLORS.green} />
+            ) : session.status === "failed" ? (
+              <X size={18} color={COLORS.red} />
+            ) : (
+              <RefreshCw size={18} color={COLORS.gold} />
+            )}
+          </span>
+          <div>
+            <p style={{ fontSize: 14.5, fontWeight: 700, margin: 0 }}>
+              {session.status === "success" ? "Transaction Successful" : session.status === "failed" ? "Transaction Failed" : "Processing USSD Transaction"}
+            </p>
+            <p style={{ fontSize: 11, color: COLORS.ink55, margin: "1px 0 0" }}>{session.network} · Live network response</p>
+          </div>
+        </div>
+
+        <div style={{ borderRadius: 14, background: COLORS.white, boxShadow: "0 1px 3px rgba(0,0,0,0.06)", padding: 14, maxHeight: 260, overflowY: "auto", marginBottom: 14 }}>
+          {session.log.map((line, i) => {
+            const isLast = i === session.log.length - 1;
+            const isPinLine = line.toLowerCase().includes("awaiting pin");
+            return (
+              <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 8, marginBottom: i === session.log.length - 1 ? 0 : 8 }}>
+                <span style={{ marginTop: 2, flexShrink: 0 }}>
+                  {isPinLine ? (
+                    <Clock size={13} color={COLORS.gold} />
+                  ) : isLast && !isTerminal ? (
+                    <RefreshCw size={13} color={COLORS.ink40} />
+                  ) : (
+                    <CheckCircle2 size={13} color={COLORS.green} />
+                  )}
+                </span>
+                <p style={{ fontSize: 12, color: isPinLine ? "#7A5A12" : COLORS.ink70, fontWeight: isPinLine ? 700 : 500, margin: 0, lineHeight: 1.4 }}>{line}</p>
+              </div>
+            );
+          })}
+        </div>
+
+        {isAwaitingPin && (
+          <p style={{ fontSize: 11.5, color: "#7A5A12", background: COLORS.goldSoft, borderRadius: 10, padding: "8px 10px", marginBottom: 12 }}>
+            Enter your Mobile Money PIN directly on your phone's network screen now. AgentPro Ghana never sees or stores your PIN.
+          </p>
+        )}
+
+        {!isTerminal && (
+          <button
+            type="button"
+            onClick={onCancel}
+            style={{ width: "100%", borderRadius: 12, border: `1px solid ${COLORS.ink12}`, background: "none", padding: "11px 0", fontSize: 13, fontWeight: 600, color: COLORS.ink70 }}
+          >
+            Cancel
+          </button>
+        )}
+      </div>
     </div>
   );
 }

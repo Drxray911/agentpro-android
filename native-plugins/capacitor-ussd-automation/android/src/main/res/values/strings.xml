@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="ussd_accessibility_service_label">AgentPro Ghana USSD Assistant</string>
+    <string name="ussd_accessibility_service_description">Used only while you confirm a Mobile Money transaction in AgentPro Ghana, to read your network\'s USSD menu screens and enter your selections (network menu choices, phone numbers, and amounts) on your behalf, so you don\'t have to type them yourself. It never enters, views, stores, or transmits your Mobile Money PIN — PIN entry always happens directly on your network\'s own screen, and this service pauses and does not touch the screen at that point. It does not read anything outside of this USSD confirmation flow.</string>
+</resources>

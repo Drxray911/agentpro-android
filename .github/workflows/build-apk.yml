@@ -36,6 +36,19 @@ jobs:
       - name: Add Capacitor Android platform
         run: rm -rf android && npx cap add android
 
+      - name: Raise minSdkVersion to 26 for USSD automation
+        # android/variables.gradle is regenerated from Capacitor's
+        # default template (minSdkVersion 22) every time `cap add`
+        # runs above, so this can't be fixed by committing a changed
+        # variables.gradle — it would just get overwritten again next
+        # build. capacitor-ussd-automation's own build.gradle requires
+        # API 26 (TelephonyManager.sendUssdRequest /
+        # createForSubscriptionId aren't available below that), and
+        # Gradle fails the whole build if the app-level minSdkVersion
+        # is lower than a module it depends on, so this has to be
+        # patched in after every regeneration, not once.
+        run: sed -i 's/minSdkVersion = .*/minSdkVersion = 26/' android/variables.gradle
+
       - name: Sync web assets into Android
         run: npx cap sync android
 
