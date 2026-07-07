@@ -110,7 +110,14 @@ class UssdAutomationPlugin : Plugin(), UssdAccessibilityService.SessionCallback 
 
         val valuesObj = call.getObject("values") ?: JSObject()
         val values = mutableMapOf<String, String>()
-        valuesObj.keys().asSequence().forEach { key -> values[key] = valuesObj.getString(key) }
+        val valuesObj = call.getObject("values") ?: JSObject()
+val values = mutableMapOf<String, String>()
+valuesObj.keys().asSequence().forEach { key ->
+    val value = valuesObj.getString(key)
+    if (value != null) {
+        values[key] = value
+    }
+}
 
         val request = UssdSessionRequest(
             subscriptionId = subscriptionId,
