@@ -1,0 +1,20 @@
+{
+  "name": "capacitor-ussd-automation",
+  "version": "1.0.0",
+  "description": "Dual-SIM detection, correct-SIM USSD dialing, and Accessibility Service-driven multi-step USSD session automation for AgentPro Ghana. Not published — used as a local file: dependency by the main app only.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "android/",
+    "index.js",
+    "index.d.ts"
+  ],
+  "capacitor": {
+    "android": {
+      "src": "android"
+    }
+  },
+  "peerDependencies": {
+    "@capacitor/core": "^6.0.0"
+  }
+}
