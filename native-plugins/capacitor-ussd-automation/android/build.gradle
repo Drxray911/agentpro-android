@@ -1,3 +1,25 @@
+// This module's own buildscript classpath — deliberately NOT relying
+// on the root project's buildscript to already have the Kotlin Gradle
+// plugin available, since Capacitor's default generated root
+// build.gradle (from `cap add`, which runs fresh on every CI build)
+// only carries the Android Gradle Plugin classpath, not Kotlin's. A
+// Gradle subproject can declare its own buildscript block independent
+// of the root, which is what makes `apply plugin: 'kotlin-android'`
+// below actually resolvable. Confirmed necessary the hard way: without
+// this block, CI failed with "Plugin with id 'kotlin-android' not
+// found", which in turn meant the android {} block below never even
+// evaluated, cascading into a second, misleading "compileSdkVersion is
+// not specified" error.
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24"
+    }
+}
+
 apply plugin: 'com.android.library'
 apply plugin: 'kotlin-android'
 
