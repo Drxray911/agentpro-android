@@ -2,15 +2,18 @@
 
 /**
  * Bootstrap Super Admin Script
- * This script creates a super admin user in the database during CI/CD pipeline
+ * Creates a super admin user in PostgreSQL during CI/CD pipeline
  * Environment variables required:
- * - DATABASE_URL: Connection string to the database
+ * - DATABASE_URL: Connection string to PostgreSQL
  * - DATABASE_SSL: Whether to use SSL for database connection (default: true)
  * - SUPER_ADMIN_EMAIL: Email for the super admin account
  * - SUPER_ADMIN_PASSWORD: Password for the super admin account
  * - SUPER_ADMIN_FULL_NAME: Full name of the super admin
  * - SUPER_ADMIN_PHONE: Phone number of the super admin
  */
+
+const { Client } = require('pg');
+const bcrypt = require('bcryptjs');
 
 const {
   DATABASE_URL,
@@ -40,29 +43,66 @@ if (missingVars.length > 0) {
 }
 
 async function bootstrapSuperAdmin() {
+  const client = new Client({
+    connectionString: DATABASE_URL,
+    ssl:
+      DATABASE_SSL === 'false'
+        ? false
+        : {
+            rejectUnauthorized: false,
+          },
+  });
+
   try {
     console.log('🚀 Starting super admin bootstrap process...');
+    console.log('🔗 Connecting to PostgreSQL database...');
 
-    // TODO: Implement database connection logic
-    // This is a placeholder for your actual database setup
-    // Replace with your actual database client (e.g., PostgreSQL, MongoDB, etc.)
+    await client.connect();
+    console.log('✅ Connected to database');
 
-    console.log('📝 Super Admin Details:');
+    // Hash the password
+    console.log('🔐 Hashing password...');
+    const hashedPassword = await bcrypt.hash(SUPER_ADMIN_PASSWORD, 10);
+
+    console.log('📝 Creating super admin user...');
     console.log(`   Email: ${SUPER_ADMIN_EMAIL}`);
     console.log(`   Full Name: ${SUPER_ADMIN_FULL_NAME}`);
     console.log(`   Phone: ${SUPER_ADMIN_PHONE}`);
-    console.log(`   Database SSL: ${DATABASE_SSL || 'true'}`);
 
-    // Example implementation for a typical Node.js + Database setup:
-    // 1. Connect to database using DATABASE_URL
-    // 2. Hash the SUPER_ADMIN_PASSWORD
-    // 3. Create user record with admin/super-admin role
-    // 4. Verify creation was successful
+    // Create or update the super admin user
+    const result = await client.query(
+      `INSERT INTO users (email, password, full_name, phone, role, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+       ON CONFLICT (email) DO UPDATE
+       SET password = $2, full_name = $3, phone = $4, role = $5, updated_at = NOW()
+       RETURNING id, email, role`,
+      [
+        SUPER_ADMIN_EMAIL,
+        hashedPassword,
+        SUPER_ADMIN_FULL_NAME,
+        SUPER_ADMIN_PHONE,
+        'super_admin',
+      ]
+    );
 
-    console.log('✅ Super admin bootstrap completed successfully!');
+    const user = result.rows[0];
+    console.log('✅ Super admin user created/updated successfully!');
+    console.log(`   User ID: ${user.id}`);
+    console.log(`   Email: ${user.email}`);
+    console.log(`   Role: ${user.role}`);
   } catch (error) {
     console.error('❌ Failed to bootstrap super admin:', error.message);
+    if (error.code === 'ENOTFOUND') {
+      console.error('   Database host not found. Check DATABASE_URL.');
+    } else if (error.code === 'ECONNREFUSED') {
+      console.error('   Connection refused. Is the database running?');
+    } else if (error.code === '42P01') {
+      console.error('   Table "users" does not exist. Check your schema.');
+    }
     process.exit(1);
+  } finally {
+    await client.end();
+    console.log('🔌 Database connection closed');
   }
 }
 
