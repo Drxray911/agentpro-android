@@ -25,11 +25,7 @@
   "scripts": {
     "build": "webpack --config webpack.config.js",
     "cap:sync": "npx cap sync android",
-    "cap:build": "npm run build && npx cap sync android"
-    {
-  "scripts": {
+    "cap:build": "npm run build && npx cap sync android",
     "bootstrap:super-admin": "node scripts/bootstrap-super-admin.js"
-  }
-}
   }
 }
